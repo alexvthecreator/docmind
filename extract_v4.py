@@ -64,9 +64,83 @@ except ImportError:
 try:
     import pytesseract
     from pdf2image import convert_from_path
-    pytesseract.get_tesseract_version()
 except Exception:
     MISSING.append("pytesseract/pdf2image/tesseract-binary")
+
+
+# ─── BUNDLED BINARY RESOLUTION ───────────────────────────────────────────────
+# When DocMind ships as a drag-to-Applications `.app`, tesseract lives inside
+# the bundle — we resolve it here so end-users never touch Homebrew or PATH.
+# Resolution order: $TESSERACT_CMD → bundled → system PATH fallback.
+
+
+def _find_bundled_tesseract() -> tuple[os.PathLike | None, os.PathLike | None]:
+    """Walk up from this file looking for a py2app-style .app bundle.
+
+    Returns (tesseract_binary, tessdata_dir) if found inside the bundle,
+    else (None, None). Works for `.app/Contents/Resources/.../extract_v4.py`.
+    """
+    here = os.path.abspath(__file__)
+    cur = os.path.dirname(here)
+    for _ in range(8):  # stop climbing after 8 levels; we never need more
+        contents = os.path.dirname(cur)  # e.g. .../DocMind.app/Contents
+        if os.path.basename(os.path.dirname(contents)).endswith(".app"):
+            res = os.path.join(contents, "Resources")
+            tcmd = os.path.join(res, "bin", "tesseract")
+            tdata = os.path.join(res, "tessdata")
+            if os.path.isfile(tcmd) and os.path.isdir(tdata):
+                return tcmd, tdata
+            return None, None
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return None, None
+
+
+def _configure_tesseract() -> None:
+    """Point pytesseract at the right tesseract binary and tessdata directory.
+
+    Priority:
+      1. $TESSERACT_CMD / $TESSDATA_PREFIX env vars (developer override)
+      2. Bundled inside the .app (end-user install)
+      3. System PATH (developer dev loop, Homebrew etc.)
+    """
+    if "pytesseract/pdf2image/tesseract-binary" in MISSING:
+        return
+
+    env_cmd = os.environ.get("TESSERACT_CMD")
+    if env_cmd and os.path.isfile(env_cmd):
+        pytesseract.pytesseract.tesseract_cmd = env_cmd
+    else:
+        bundled_cmd, bundled_data = _find_bundled_tesseract()
+        if bundled_cmd:
+            pytesseract.pytesseract.tesseract_cmd = str(bundled_cmd)
+            # tesseract looks for tessdata via TESSDATA_PREFIX or a sibling path.
+            if bundled_data and "TESSDATA_PREFIX" not in os.environ:
+                os.environ["TESSDATA_PREFIX"] = str(bundled_data)
+            # Also ensure bundled dylibs are discoverable by the tesseract binary.
+            fw = os.path.normpath(
+                os.path.join(
+                    os.path.dirname(str(bundled_cmd)), "..", "..", "Frameworks"
+                )
+            )
+            if os.path.isdir(fw):
+                existing = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "")
+                if fw not in existing.split(os.pathsep):
+                    os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = (
+                        fw + (os.pathsep + existing if existing else "")
+                    )
+
+    # Verify tesseract actually responds. If not, degrade gracefully.
+    try:
+        pytesseract.get_tesseract_version()
+    except Exception:
+        if "pytesseract/pdf2image/tesseract-binary" not in MISSING:
+            MISSING.append("pytesseract/pdf2image/tesseract-binary")
+
+
+_configure_tesseract()
 try:
     from PIL import Image
 except ImportError:
