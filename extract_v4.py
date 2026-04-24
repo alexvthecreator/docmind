@@ -275,6 +275,14 @@ def score_text_quality(text: str) -> QualityScore:
         - 100 * garbage_ratio
         + count_bonus
     )
+
+    # E2: scrambled-ligature / broken-CMap detector.
+    # Real English always has >15% common words OR average word length >3.
+    # When both are low across 30+ tokens, it's almost certainly scrambled
+    # text from a broken ToUnicode CMap — demote the score so OCR wins.
+    if common_ratio < 0.15 and avg_len < 3.0 and word_count > 30:
+        score = score * 0.1
+
     score = max(0.0, min(100.0, score))
 
     return QualityScore(
@@ -490,6 +498,7 @@ class PageResult:
     score: QualityScore
     text_score: QualityScore | None = None
     ocr_score: QualityScore | None = None
+    ocr_error: str | None = None   # set when OCR was attempted and threw
 
 
 def extract_page(
@@ -529,16 +538,39 @@ def extract_page(
         )
 
     # Step 3: OCR
+    ocr_error: str | None = None
     try:
         image = pdf_page_to_image(doc, page_idx, dpi=300)
         ocr_raw = ocr_page(image)
         ocr_normalized = normalize_encoding(ocr_raw)
         ocr_score = score_text_quality(ocr_normalized)
-    except Exception:
+    except Exception as e:
+        # E1: surface the exception instead of swallowing it silently
+        ocr_error = f"{type(e).__name__}: {e}"
         ocr_normalized = ""
-        ocr_score = QualityScore(0.0, 0, 0.0, 1.0, 0.0, "ocr exception")
+        ocr_score = QualityScore(
+            0.0, 0, 0.0, 1.0, 0.0, f"ocr exception: {type(e).__name__}"
+        )
 
     # Step 4: pick the winner
+    # E3: decision rule hardening — if the text layer has near-zero real English
+    # (broken ToUnicode CMap, scrambled ligatures) and OCR looks plausible,
+    # OCR wins regardless of raw score margin.
+    if (
+        text_score.common_word_ratio < 0.10
+        and ocr_score.common_word_ratio > 0.30
+        and ocr_normalized.strip()
+    ):
+        return PageResult(
+            page_num=page_num,
+            method="ocr",
+            text=ocr_normalized,
+            score=ocr_score,
+            text_score=text_score,
+            ocr_score=ocr_score,
+            ocr_error=ocr_error,
+        )
+
     if ocr_score.score > text_score.score + 5:
         # OCR won by a meaningful margin
         return PageResult(
@@ -548,6 +580,7 @@ def extract_page(
             score=ocr_score,
             text_score=text_score,
             ocr_score=ocr_score,
+            ocr_error=ocr_error,
         )
     elif text_score.score > 0:
         return PageResult(
@@ -557,6 +590,7 @@ def extract_page(
             score=text_score,
             text_score=text_score,
             ocr_score=ocr_score,
+            ocr_error=ocr_error,
         )
     elif ocr_score.score > 0:
         return PageResult(
@@ -566,6 +600,7 @@ def extract_page(
             score=ocr_score,
             text_score=text_score,
             ocr_score=ocr_score,
+            ocr_error=ocr_error,
         )
     else:
         return PageResult(
@@ -573,6 +608,7 @@ def extract_page(
             method="none",
             text="",
             score=text_score,
+            ocr_error=ocr_error,
         )
 
 
@@ -625,6 +661,8 @@ class BookResult:
     markdown: str = ""
     issues: list[str] = field(default_factory=list)
     warnings_: list[str] = field(default_factory=list)
+    ocr_errors: list[str] = field(default_factory=list)  # "p{N}: {ExcType}: {msg}"
+    reason: str = ""
 
 
 def extract_pdf(
@@ -664,6 +702,11 @@ def extract_pdf(
             )
 
     doc.close()
+
+    # Collect OCR exception reports from individual pages
+    for pr in page_results:
+        if pr.ocr_error:
+            result.ocr_errors.append(f"p{pr.page_num}: {pr.ocr_error}")
 
     # Strip running boilerplate across all pages
     boilerplate = detect_running_boilerplate(page_results)
@@ -826,6 +869,8 @@ def process_one_book(
         "avg_score": book.avg_page_score,
         "warnings": book.warnings_,
         "issues": book.issues,
+        "ocr_errors": book.ocr_errors,
+        "reason": book.reason,
     }
 
 
@@ -913,13 +958,30 @@ def write_qc_report(path: Path, results: list[dict]) -> None:
                 continue
             score = r.get("avg_score", 0)
             grade = "✅ GOOD" if score >= 60 else ("⚠️ REVIEW" if score >= 40 else "❌ POOR")
-            notes = "; ".join(r.get("warnings", [])) or "—"
+            note_parts = list(r.get("warnings", []))
+            if r.get("reason"):
+                note_parts.append(r["reason"])
+            if r.get("ocr_errors"):
+                note_parts.append(f"{len(r['ocr_errors'])} OCR errors")
+            notes = "; ".join(note_parts) or "—"
             f.write(
                 f"| {n} | {r['file'][:40]} | {r.get('pages_extracted', 0)} | "
                 f"{r.get('pages_via_text', 0)} | {r.get('pages_via_ocr', 0)} | "
                 f"{r.get('pages_skipped', 0)} | {r.get('word_count', 0):,} | "
                 f"{score:.0f} | {grade} | {notes} |\n"
             )
+
+        # Per-book OCR-error detail appendix (only if any book had errors)
+        books_with_ocr_errors = [r for r in results if r.get("ocr_errors")]
+        if books_with_ocr_errors:
+            f.write("\n---\n\n## OCR exceptions (detail)\n\n")
+            for r in books_with_ocr_errors:
+                f.write(f"### {r['file']}\n\n")
+                for err in r["ocr_errors"][:50]:
+                    f.write(f"- {err}\n")
+                if len(r["ocr_errors"]) > 50:
+                    f.write(f"- … and {len(r['ocr_errors']) - 50} more\n")
+                f.write("\n")
 
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────
