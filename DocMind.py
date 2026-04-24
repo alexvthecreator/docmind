@@ -26,7 +26,9 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QProgressBar, QTextEdit, QFileDialog,
-    QFrame, QSizePolicy, QScrollArea, QCheckBox,
+    QFrame, QSizePolicy, QScrollArea, QCheckBox, QMenu,
+    QDialog, QComboBox, QLineEdit, QPlainTextEdit, QListWidget,
+    QListWidgetItem, QDialogButtonBox,
 )
 
 # Import the extraction engine. extract_v4.py must sit next to this file.
@@ -320,7 +322,9 @@ class _StoppedError(Exception):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class DropZone(QLabel):
-    folder_dropped = Signal(Path)
+    """Accepts drag-drop or click-to-pick of PDFs, EPUBs, folders, or any mix."""
+
+    items_dropped = Signal(list)  # list[Path]
 
     def __init__(self):
         super().__init__()
@@ -328,82 +332,144 @@ class DropZone(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumHeight(280)
         self.setWordWrap(True)
+        self._processing = False
         self._set_idle()
+
+    # ── State displays ──────────────────────────────────────────────────
 
     def _set_idle(self):
         self.setText(
             "📄\n\n"
-            "Drop a folder of PDFs here\n\n"
-            "or click to browse\n\n"
+            "Drop PDFs, EPUBs, or a folder here\n\n"
+            "or click to pick files / folder\n\n"
             "\n"
-            "PDF files only"
+            "PDF and EPUB files"
         )
         self.setStyleSheet(self._style(active=False))
 
     def _set_active(self):
-        self.setText("📥\n\nRelease to load these PDFs")
+        self.setText("📥\n\nRelease to start extraction")
         self.setStyleSheet(self._style(active=True))
 
-    def _set_loaded(self, folder: Path, count: int):
-        plural = "s" if count != 1 else ""
+    def _set_processing(self):
         self.setText(
-            f"✓\n\n"
-            f"{folder.name}\n"
-            f"{count} PDF{plural} ready\n\n"
-            f"Click to choose a different folder"
+            "⏳\n\n"
+            "Extraction in progress\n\n"
+            "Drop more once the current batch completes"
         )
-        self.setStyleSheet(self._style(active=False, loaded=True))
+        self.setStyleSheet(self._style(active=False, disabled=True))
 
-    def _style(self, active=False, loaded=False):
-        if active:
+    def set_processing(self, on: bool):
+        """Called by the main window to lock/unlock the zone during a run."""
+        self._processing = on
+        if on:
+            self._set_processing()
+        else:
+            self._set_idle()
+
+    def _style(self, active=False, loaded=False, disabled=False):
+        if disabled:
+            border = COLOR_BORDER
+            bg = COLOR_BG
+            text = COLOR_TEXT_DIM
+        elif active:
             border = COLOR_ACCENT
             bg = COLOR_DROP_ACTIVE
+            text = COLOR_TEXT
         elif loaded:
             border = COLOR_ACCENT
             bg = COLOR_SURFACE
+            text = COLOR_TEXT
         else:
             border = COLOR_BORDER
             bg = COLOR_SURFACE
+            text = COLOR_TEXT
         return f"""
             QLabel {{
                 background-color: {bg};
                 border: 2px dashed {border};
                 border-radius: 16px;
-                color: {COLOR_TEXT};
+                color: {text};
                 font-size: 16px;
                 padding: 40px;
             }}
         """
 
+    # ── Drop-payload normalisation ──────────────────────────────────────
+
+    @staticmethod
+    def _paths_from_urls(urls) -> list[Path]:
+        """Return the subset of dropped URLs that are valid local PDFs,
+        EPUBs, or directories. Order preserved, duplicates removed."""
+        seen: set[Path] = set()
+        out: list[Path] = []
+        for u in urls:
+            local = u.toLocalFile()
+            if not local:
+                continue
+            p = Path(local)
+            if p in seen:
+                continue
+            if p.is_dir():
+                seen.add(p)
+                out.append(p)
+            elif p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS:
+                seen.add(p)
+                out.append(p)
+        return out
+
+    # ── Drag and drop events ────────────────────────────────────────────
+
     def dragEnterEvent(self, event: QDragEnterEvent):
-        if event.mimeData().hasUrls():
-            urls = event.mimeData().urls()
-            if len(urls) == 1 and urls[0].toLocalFile():
-                path = Path(urls[0].toLocalFile())
-                if path.is_dir():
-                    event.acceptProposedAction()
-                    self._set_active()
-                    return
-        event.ignore()
+        if self._processing or not event.mimeData().hasUrls():
+            event.ignore()
+            return
+        paths = self._paths_from_urls(event.mimeData().urls())
+        if paths:
+            event.acceptProposedAction()
+            self._set_active()
+        else:
+            event.ignore()
 
     def dragLeaveEvent(self, event):
-        self._set_idle()
+        if not self._processing:
+            self._set_idle()
 
     def dropEvent(self, event: QDropEvent):
-        urls = event.mimeData().urls()
-        if urls:
-            path = Path(urls[0].toLocalFile())
-            if path.is_dir():
-                self.folder_dropped.emit(path)
-                event.acceptProposedAction()
+        if self._processing:
+            event.ignore()
+            return
+        paths = self._paths_from_urls(event.mimeData().urls())
+        if paths:
+            event.acceptProposedAction()
+            self.items_dropped.emit(paths)
+
+    # ── Click-to-pick ───────────────────────────────────────────────────
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            folder = QFileDialog.getExistingDirectory(
-                self, "Choose a folder of PDFs", str(Path.home())
-            )
-            if folder:
-                self.folder_dropped.emit(Path(folder))
+        if event.button() != Qt.LeftButton or self._processing:
+            return
+        menu = QMenu(self)
+        menu.addAction("Pick files…", self._pick_files)
+        menu.addAction("Pick folder…", self._pick_folder)
+        menu.exec(event.globalPosition().toPoint())
+
+    def _pick_files(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Choose PDFs and/or EPUBs",
+            str(Path.home()),
+            "Documents (*.pdf *.epub)",
+        )
+        if files:
+            self.items_dropped.emit([Path(f) for f in files])
+
+    def _pick_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose a folder of PDFs/EPUBs", str(Path.home())
+        )
+        if folder:
+            self.items_dropped.emit([Path(folder)])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -582,6 +648,8 @@ class DocMindWindow(QMainWindow):
         self.source_folder: Path | None = None
         self.worker: ExtractionWorker | None = None
         self.file_rows: dict[str, FileRow] = {}
+        self.last_results_files: list[Path] = []
+        self.output_folder: Path | None = None
 
         self.setWindowTitle("DocMind")
         self.setMinimumSize(720, 620)
@@ -683,7 +751,7 @@ class DocMindWindow(QMainWindow):
         layout.addLayout(header)
 
         self.drop_zone = DropZone()
-        self.drop_zone.folder_dropped.connect(self._on_folder_selected)
+        self.drop_zone.items_dropped.connect(self._on_items_dropped)
         layout.addWidget(self.drop_zone)
 
         options_layout = QHBoxLayout()
@@ -692,22 +760,12 @@ class DocMindWindow(QMainWindow):
         )
         options_layout.addWidget(self.force_ocr_check)
         options_layout.addStretch()
-        layout.addLayout(options_layout)
-
-        action_layout = QHBoxLayout()
-        action_layout.setSpacing(12)
-        self.extract_btn = QPushButton("Extract")
-        self.extract_btn.setEnabled(False)
-        self.extract_btn.clicked.connect(self._on_extract_clicked)
-        self.extract_btn.setMinimumHeight(44)
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.setObjectName("secondary")
         self.stop_btn.setVisible(False)
         self.stop_btn.clicked.connect(self._on_stop_clicked)
-        self.stop_btn.setMinimumHeight(44)
-        action_layout.addWidget(self.extract_btn, stretch=1)
-        action_layout.addWidget(self.stop_btn)
-        layout.addLayout(action_layout)
+        options_layout.addWidget(self.stop_btn)
+        layout.addLayout(options_layout)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setTextVisible(False)
@@ -753,38 +811,43 @@ class DocMindWindow(QMainWindow):
         self.reveal_btn.setVisible(False)
         layout.addWidget(self.reveal_btn)
 
-    def _on_folder_selected(self, folder: Path):
-        self.source_folder = folder
-        count = sum(
-            1 for f in folder.iterdir()
-            if f.suffix.lower() == ".pdf"
-        )
-        self.drop_zone._set_loaded(folder, count)
-        self.extract_btn.setEnabled(count > 0)
-        self.progress_bar.setVisible(False)
-        self.status_label.setVisible(False)
-        self.file_list_scroll.setVisible(False)
-        self.finished_label.setVisible(False)
-        self.reveal_btn.setVisible(False)
-        self._clear_file_list()
-
     def _clear_file_list(self):
         for row in self.file_rows.values():
             row.deleteLater()
         self.file_rows.clear()
 
-    def _on_extract_clicked(self):
-        if not self.source_folder:
-            return
-        output_folder = self.source_folder / "extracted"
+    @staticmethod
+    def _derive_output_folder(paths: list[Path]) -> Path:
+        """Decide where to write `extracted/` for a given drop payload.
 
-        files = collect_files([self.source_folder])
+        - Single folder dropped → <folder>/extracted/
+        - One or more files dropped → <parent_of_first>/extracted/
+        """
+        if len(paths) == 1 and paths[0].is_dir():
+            return paths[0] / "extracted"
+        for p in paths:
+            if p.is_file():
+                return p.parent / "extracted"
+        # Fallback: first folder parent
+        return paths[0].parent / "extracted"
+
+    def _on_items_dropped(self, paths: list[Path]):
+        """Auto-start extraction as soon as PDFs/EPUBs/folders are dropped."""
+        if self.worker and self.worker.isRunning():
+            return  # Guard against drops while a run is in flight
+
+        files = collect_files(paths)
         if not files:
             self.status_label.setText(
-                "No PDF or EPUB files found in that folder."
+                "No PDF or EPUB files found in that drop."
             )
             self.status_label.setVisible(True)
             return
+
+        output_folder = self._derive_output_folder(paths)
+        self.source_folder = (
+            paths[0] if paths[0].is_dir() else paths[0].parent
+        )
 
         self._clear_file_list()
         for f in files:
@@ -794,7 +857,7 @@ class DocMindWindow(QMainWindow):
                 self.file_list_layout.count() - 1, row
             )
 
-        self.extract_btn.setVisible(False)
+        self.drop_zone.set_processing(True)
         self.stop_btn.setVisible(True)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
@@ -817,6 +880,9 @@ class DocMindWindow(QMainWindow):
         self.worker.finished_all.connect(self._on_finished_all)
         self.worker.error.connect(self._on_error)
         self.output_folder = output_folder
+        self.last_results_files = [
+            output_folder / extract_v4.slugify(f.name) for f in files
+        ]
         self.worker.start()
 
     def _on_stop_clicked(self):
@@ -847,7 +913,6 @@ class DocMindWindow(QMainWindow):
         self.status_label.setText(text)
 
     def _on_finished_all(self, summary: str):
-        self.extract_btn.setVisible(True)
         self.stop_btn.setVisible(False)
         self.force_ocr_check.setEnabled(True)
         self.progress_bar.setValue(100)
@@ -855,12 +920,24 @@ class DocMindWindow(QMainWindow):
         self.finished_label.setText(summary)
         self.finished_label.setVisible(True)
         self.reveal_btn.setVisible(True)
+        self.drop_zone.set_processing(False)
+        self._update_export_availability()
 
     def _on_error(self, msg: str):
-        self.extract_btn.setVisible(True)
         self.stop_btn.setVisible(False)
         self.force_ocr_check.setEnabled(True)
         self.status_label.setText(f"Error: {msg.splitlines()[0]}")
+        self.drop_zone.set_processing(False)
+
+    def _update_export_availability(self):
+        """Enable the Export button if at least one extracted MD exists."""
+        if not hasattr(self, "export_btn"):
+            return
+        any_output = any(
+            p.exists() for p in getattr(self, "last_results_files", [])
+        )
+        self.export_btn.setVisible(any_output)
+        self.export_btn.setEnabled(any_output)
 
     def _reveal_output(self):
         if hasattr(self, "output_folder") and self.output_folder.exists():
