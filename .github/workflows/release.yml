@@ -17,6 +17,11 @@ jobs:
     permissions:
       contents: write   # upload DMG as a Release asset
     timeout-minutes: 30
+    env:
+      # Opt into Node.js 24 for actions/checkout, setup-python,
+      # upload-artifact, gh-release. They already support Node 24; this
+      # just flips them off the deprecated Node 20 default.
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
     steps:
       - name: Checkout

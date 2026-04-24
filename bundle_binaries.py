@@ -194,6 +194,53 @@ def bundle(app: Path) -> int:
     except ImportError:
         print("  (Skipped — PIL not importable in this environment.)")
 
+    # ── 5. Re-sign the .app bundle ──────────────────────────────────────
+    # py2app already signs the .app at the end of its build, but we've
+    # modified the bundle since then (copied tesseract, tessdata, dylibs;
+    # rewritten install names). Those modifications invalidate py2app's
+    # signature, and macOS Gatekeeper reports an invalid signature as
+    # "DocMind is damaged and can't be opened" rather than "unidentified
+    # developer", which blocks launch outright. Re-sign the whole bundle
+    # ad-hoc (self-signed, no developer identity) so Gatekeeper's signature
+    # check passes and the user instead sees the normal "right-click →
+    # Open" unidentified-developer prompt on first launch.
+    # `codesign --deep` refuses to sign any file that carries extended
+    # attributes ("resource forks", Finder info, quarantine flags, etc.) — it
+    # treats them as smuggled data the signature can't cover. macOS tools
+    # occasionally add these during the build, so strip them before signing.
+    print("Stripping extended attributes from .app …")
+    r = subprocess.run(
+        ["xattr", "-cr", str(app)],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        print("ERROR: xattr -cr failed.", file=sys.stderr)
+        sys.stderr.write(r.stdout)
+        sys.stderr.write(r.stderr)
+        return 1
+
+    print("Re-signing .app bundle (ad-hoc) …")
+    r = subprocess.run(
+        ["codesign", "--force", "--deep", "--sign", "-", str(app)],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        print("ERROR: codesign failed.", file=sys.stderr)
+        sys.stderr.write(r.stdout)
+        sys.stderr.write(r.stderr)
+        return 1
+    # Verify the signature is valid
+    r = subprocess.run(
+        ["codesign", "--verify", "--verbose=2", str(app)],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        print("ERROR: codesign verification failed.", file=sys.stderr)
+        sys.stderr.write(r.stdout)
+        sys.stderr.write(r.stderr)
+        return 1
+    print("  OK — signature verified")
+
     print(f"\n✓ Binary bundling complete for {app.name}")
     print(f"  .app size: {du_human(app)}")
     return 0

@@ -28,10 +28,16 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 
 if [[ ! -f "DocMind.icns" ]]; then
-  echo "▶ [0/3] Regenerating DocMind.icns (gitignored build artifact) …"
+  echo "▶ [0a/3] Regenerating DocMind.icns (gitignored build artifact) …"
   # Qt needs an offscreen platform on headless CI runners to draw without
   # a display. Local builds ignore this when a display is present.
   QT_QPA_PLATFORM=offscreen python3 make_icon.py
+  echo ""
+fi
+
+if [[ ! -f "docs/dmg_background.png" || ! -f "docs/dmg_background@2x.png" ]]; then
+  echo "▶ [0b/3] Regenerating DMG window background …"
+  QT_QPA_PLATFORM=offscreen python3 make_dmg_bg.py
   echo ""
 fi
 

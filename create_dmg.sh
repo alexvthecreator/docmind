@@ -25,6 +25,7 @@ VERSION="${1:-1.0.0}"
 APP_DIR="dist/DocMind.app"
 DMG_OUT="dist/DocMind-${VERSION}.dmg"
 ICON_FILE="DocMind.icns"
+BG_FILE="docs/dmg_background.png"
 
 if ! command -v create-dmg >/dev/null 2>&1; then
   echo "ERROR: create-dmg not on PATH. Run: brew install create-dmg" >&2
@@ -47,6 +48,13 @@ else
   echo "  note: $ICON_FILE not found — DMG will use the default volume icon."
 fi
 
+BG_ARGS=()
+if [[ -f "$BG_FILE" ]]; then
+  BG_ARGS=(--background "$BG_FILE")
+else
+  echo "  note: $BG_FILE not found — DMG will use the plain default background."
+fi
+
 echo "Packaging $APP_DIR → $DMG_OUT (version $VERSION)…"
 # ${arr[@]+"${arr[@]}"} is the bash idiom for safely expanding a possibly-empty
 # array under `set -u`: it expands to nothing when the array has no elements,
@@ -54,12 +62,12 @@ echo "Packaging $APP_DIR → $DMG_OUT (version $VERSION)…"
 create-dmg \
   --volname "DocMind" \
   ${VOLICON_ARGS[@]+"${VOLICON_ARGS[@]}"} \
+  ${BG_ARGS[@]+"${BG_ARGS[@]}"} \
   --window-size 520 340 \
   --icon-size 96 \
   --icon "DocMind.app" 130 170 \
   --hide-extension "DocMind.app" \
   --app-drop-link 390 170 \
-  --no-internet-enable \
   "$DMG_OUT" \
   "$APP_DIR"
 
