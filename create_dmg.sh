@@ -43,12 +43,17 @@ rm -f "$DMG_OUT"
 VOLICON_ARGS=()
 if [[ -f "$ICON_FILE" ]]; then
   VOLICON_ARGS=(--volicon "$ICON_FILE")
+else
+  echo "  note: $ICON_FILE not found — DMG will use the default volume icon."
 fi
 
 echo "Packaging $APP_DIR → $DMG_OUT (version $VERSION)…"
+# ${arr[@]+"${arr[@]}"} is the bash idiom for safely expanding a possibly-empty
+# array under `set -u`: it expands to nothing when the array has no elements,
+# and to the full array when it does.
 create-dmg \
   --volname "DocMind" \
-  "${VOLICON_ARGS[@]}" \
+  ${VOLICON_ARGS[@]+"${VOLICON_ARGS[@]}"} \
   --window-size 520 340 \
   --icon-size 96 \
   --icon "DocMind.app" 130 170 \

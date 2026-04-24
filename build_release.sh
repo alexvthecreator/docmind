@@ -27,6 +27,14 @@ echo " DocMind release build — VERSION $VERSION"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
+if [[ ! -f "DocMind.icns" ]]; then
+  echo "▶ [0/3] Regenerating DocMind.icns (gitignored build artifact) …"
+  # Qt needs an offscreen platform on headless CI runners to draw without
+  # a display. Local builds ignore this when a display is present.
+  QT_QPA_PLATFORM=offscreen python3 make_icon.py
+  echo ""
+fi
+
 echo "▶ [1/3] py2app — building dist/DocMind.app …"
 rm -rf build dist
 python3 build_app.py py2app
