@@ -38,6 +38,12 @@ except ImportError:
     print("ERROR: extract_v4.py must be in the same folder as DocMind.py")
     sys.exit(1)
 
+# Skill-export helper — pooling references + writing target-shaped prompts.
+try:
+    import skill_export
+except ImportError:
+    skill_export = None  # type: ignore
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DESIGN TOKENS
@@ -639,6 +645,159 @@ class FileRow(QFrame):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# EXPORT-FOR-AI DIALOG
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ExportDialog(QDialog):
+    """Pool extracted MD files into a target-shaped skill package + PROMPT.md.
+
+    The LLM still builds the skill metadata (SKILL.md / GEMINI.md / Custom
+    GPT instructions / Cursor rules). DocMind just stages references and
+    hands the user a ready-to-paste prompt.
+    """
+
+    def __init__(
+        self,
+        files: list[Path],
+        suggested_name: str,
+        output_root: Path,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Export for AI")
+        self.setMinimumWidth(540)
+        self._files = files
+        self._output_root = output_root
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+
+        # Target
+        layout.addWidget(self._label("Target AI"))
+        self.target_combo = QComboBox()
+        for t in skill_export.TARGETS.values():
+            self.target_combo.addItem(t.display_name, userData=t.id)
+        layout.addWidget(self.target_combo)
+
+        # Name
+        layout.addWidget(self._label("Skill name"))
+        self.name_edit = QLineEdit(skill_export.slugify_name(suggested_name))
+        layout.addWidget(self.name_edit)
+
+        # Description
+        layout.addWidget(self._label("Short description"))
+        default_desc = (
+            "Reference material extracted by DocMind from: "
+            + ", ".join(f.stem for f in files[:3])
+            + ("…" if len(files) > 3 else "")
+        )
+        self.desc_edit = QPlainTextEdit(default_desc)
+        self.desc_edit.setFixedHeight(60)
+        layout.addWidget(self.desc_edit)
+
+        # Files
+        layout.addWidget(self._label("Files to include"))
+        self.files_list = QListWidget()
+        self.files_list.setFixedHeight(110)
+        for f in files:
+            item = QListWidgetItem(f.name)
+            item.setData(Qt.UserRole, f)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            self.files_list.addItem(item)
+        layout.addWidget(self.files_list)
+
+        # Clipboard option
+        self.clip_check = QCheckBox("Copy prompt to clipboard on success")
+        self.clip_check.setChecked(True)
+        layout.addWidget(self.clip_check)
+
+        # Status line (inline — no popup)
+        self.status = QLabel("")
+        self.status.setStyleSheet(
+            f"color: {COLOR_TEXT_DIM}; font-size: 12px;"
+        )
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        # Buttons
+        buttons = QDialogButtonBox()
+        self.create_btn = buttons.addButton(
+            "Create Package", QDialogButtonBox.AcceptRole
+        )
+        buttons.addButton(QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_create)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        # Inherit parent styling
+        if parent:
+            self.setStyleSheet(parent.styleSheet() + f"""
+                QDialog {{ background-color: {COLOR_BG}; }}
+                QLineEdit, QPlainTextEdit, QComboBox, QListWidget {{
+                    background-color: {COLOR_SURFACE};
+                    color: {COLOR_TEXT};
+                    border: 1px solid {COLOR_BORDER};
+                    border-radius: 6px;
+                    padding: 6px;
+                    font-size: 13px;
+                }}
+                QComboBox::drop-down {{ border: none; }}
+            """)
+
+    @staticmethod
+    def _label(text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
+            f"color: {COLOR_TEXT_DIM}; font-size: 11px; "
+            "font-weight: 600; text-transform: uppercase;"
+        )
+        return lbl
+
+    def _checked_files(self) -> list[Path]:
+        files = []
+        for i in range(self.files_list.count()):
+            item = self.files_list.item(i)
+            if item.checkState() == Qt.Checked:
+                files.append(Path(item.data(Qt.UserRole)))
+        return files
+
+    def _on_create(self):
+        target_id = self.target_combo.currentData()
+        name = self.name_edit.text().strip() or "untitled"
+        description = self.desc_edit.toPlainText().strip()
+        files = self._checked_files()
+        if not files:
+            self.status.setText("Pick at least one file to include.")
+            return
+
+        try:
+            package_root = skill_export.build_package(
+                target_id=target_id,
+                name=name,
+                description=description,
+                source_files=files,
+                output_root=self._output_root,
+            )
+        except Exception as e:
+            self.status.setText(f"Failed: {type(e).__name__}: {e}")
+            return
+
+        if self.clip_check.isChecked():
+            prompt_text = (package_root / "PROMPT.md").read_text(
+                encoding="utf-8"
+            )
+            QApplication.clipboard().setText(prompt_text)
+
+        # Reveal the package folder in Finder for the user to inspect.
+        import subprocess
+        subprocess.run(["open", str(package_root)])
+
+        self.accept()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # MAIN WINDOW
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -750,6 +909,11 @@ class DocMindWindow(QMainWindow):
         header.addWidget(subtitle)
         layout.addLayout(header)
 
+        # U6: OCR health banner — added only if the smoke test fails at startup.
+        ok, err = extract_v4.self_test_ocr()
+        if not ok:
+            layout.addWidget(self._build_ocr_banner(err))
+
         self.drop_zone = DropZone()
         self.drop_zone.items_dropped.connect(self._on_items_dropped)
         layout.addWidget(self.drop_zone)
@@ -805,11 +969,19 @@ class DocMindWindow(QMainWindow):
         self.finished_label.setVisible(False)
         layout.addWidget(self.finished_label)
 
+        completion_actions = QHBoxLayout()
+        completion_actions.setSpacing(12)
         self.reveal_btn = QPushButton("Show in Finder")
         self.reveal_btn.setObjectName("secondary")
         self.reveal_btn.clicked.connect(self._reveal_output)
         self.reveal_btn.setVisible(False)
-        layout.addWidget(self.reveal_btn)
+        self.export_btn = QPushButton("Export for AI…")
+        self.export_btn.clicked.connect(self._on_export_clicked)
+        self.export_btn.setVisible(False)
+        self.export_btn.setEnabled(False)
+        completion_actions.addWidget(self.reveal_btn)
+        completion_actions.addWidget(self.export_btn)
+        layout.addLayout(completion_actions)
 
     def _clear_file_list(self):
         for row in self.file_rows.values():
@@ -940,9 +1112,75 @@ class DocMindWindow(QMainWindow):
         self.export_btn.setEnabled(any_output)
 
     def _reveal_output(self):
-        if hasattr(self, "output_folder") and self.output_folder.exists():
+        if hasattr(self, "output_folder") and self.output_folder and self.output_folder.exists():
             import subprocess
             subprocess.run(["open", str(self.output_folder)])
+
+    # ── OCR health banner ────────────────────────────────────────────────
+
+    def _build_ocr_banner(self, err: str) -> QWidget:
+        """Yellow banner shown when self_test_ocr() fails at startup."""
+        banner = QFrame()
+        banner.setStyleSheet(f"""
+            QFrame {{
+                background-color: #3a2f1a;
+                border: 1px solid {COLOR_WARNING};
+                border-radius: 8px;
+            }}
+            QLabel {{
+                color: {COLOR_WARNING};
+                font-size: 12px;
+                border: none;
+                background: transparent;
+            }}
+            QPushButton {{
+                background: transparent;
+                color: {COLOR_WARNING};
+                border: none;
+                padding: 4px 8px;
+                font-size: 14px;
+                font-weight: 700;
+            }}
+            QPushButton:hover {{ color: {COLOR_TEXT}; }}
+        """)
+        h = QHBoxLayout(banner)
+        h.setContentsMargins(12, 8, 8, 8)
+        msg = QLabel(
+            f"⚠  OCR unavailable — {err}.  "
+            "Re-run install.sh or check that tesseract is on your PATH."
+        )
+        msg.setWordWrap(True)
+        dismiss = QPushButton("✕")
+        dismiss.setFixedWidth(28)
+        dismiss.clicked.connect(lambda: banner.setVisible(False))
+        h.addWidget(msg, stretch=1)
+        h.addWidget(dismiss)
+        return banner
+
+    # ── Export for AI ────────────────────────────────────────────────────
+
+    def _on_export_clicked(self):
+        if not skill_export:
+            self.status_label.setText(
+                "skill_export module unavailable — cannot export."
+            )
+            self.status_label.setVisible(True)
+            return
+        existing = [p for p in self.last_results_files if p.exists()]
+        if not existing:
+            return
+        suggested_name = (
+            self.source_folder.name
+            if self.source_folder and self.source_folder.is_dir()
+            else existing[0].stem
+        )
+        dialog = ExportDialog(
+            files=existing,
+            suggested_name=suggested_name,
+            output_root=self.output_folder or existing[0].parent,
+            parent=self,
+        )
+        dialog.exec()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
