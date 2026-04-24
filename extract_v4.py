@@ -429,6 +429,34 @@ def ocr_page(pil_image: "Image.Image") -> str:
         return ""
 
 
+# ─── OCR STARTUP SMOKE TEST ──────────────────────────────────────────────────
+
+def self_test_ocr() -> tuple[bool, str]:
+    """Quick end-to-end OCR check for app startup.
+
+    Generates a synthetic 200×60 image with the words 'Hello world', runs the
+    same OCR pipeline a real page would, and checks for either word in the
+    output. Returns (True, '') on success or (False, error_repr) on any
+    failure — a missing tesseract binary, a broken pytesseract install, a
+    language pack absent, etc. The UI calls this on launch and shows a
+    persistent banner if OCR is unavailable, so the user doesn't waste 20
+    minutes on an unrecoverable run.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        img = Image.new("RGB", (300, 80), color="white")
+        draw = ImageDraw.Draw(img)
+        # Use default bitmap font — always available, no filesystem assumptions
+        draw.text((20, 25), "Hello world", fill="black")
+        out = pytesseract.image_to_string(img, lang="eng", config="--oem 1 --psm 6")
+        out_lower = (out or "").lower()
+        if "hello" in out_lower or "world" in out_lower:
+            return True, ""
+        return False, f"OCR ran but returned unexpected output: {out!r}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
 # ─── PDF → PAGE IMAGES (streaming) ───────────────────────────────────────────
 
 def pdf_page_to_image(doc, page_idx: int, dpi: int = 300) -> "Image.Image":
@@ -670,8 +698,14 @@ def extract_pdf(
     force_ocr: bool = False,
     verbose: bool = True,
     progress_prefix: str = "",
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> BookResult:
-    """Extract an entire PDF to clean Markdown for LLM consumption."""
+    """Extract an entire PDF to clean Markdown for LLM consumption.
+
+    If progress_callback is provided, it is invoked after each page with
+    (pages_done, total_pages). The callback may raise to request early
+    termination — the exception propagates up and the caller handles it.
+    """
     result = BookResult(path=pdf_path)
 
     try:
@@ -700,6 +734,8 @@ def extract_pdf(
                 f"(last: {pr.method}, score {pr.score.score:.0f})",
                 file=sys.stderr,
             )
+        if progress_callback is not None:
+            progress_callback(idx + 1, n_pages)
 
     doc.close()
 
@@ -750,7 +786,46 @@ def extract_pdf(
             f"({result.pages_extracted})"
         )
 
+    # E4: human-readable reason explaining why this book scored the way it did.
+    # First match wins; order matters (most urgent/diagnostic first).
+    result.reason = _reason_for_book(result)
+
     return result
+
+
+def _reason_for_book(r: BookResult) -> str:
+    """Produce a one-line human-readable explanation of the extraction outcome."""
+    if r.ocr_errors:
+        # Surface the first exception type so the user has a pointer to the cause
+        first = r.ocr_errors[0]
+        # Format is "p{N}: {ExcType}: {msg}" — pull the exception type
+        try:
+            exc_type = first.split(": ", 2)[1]
+        except IndexError:
+            exc_type = "error"
+        return (
+            f"OCR failed on {len(r.ocr_errors)} pages ({exc_type}) — "
+            "text layer used as fallback."
+        )
+    if r.pages_extracted == 0:
+        return "No pages extracted — source may be empty, encrypted, or unreadable."
+    if r.avg_page_score < 40:
+        return "Low-quality source — review recommended."
+    if r.pages_via_ocr == 0 and r.avg_page_score >= 60:
+        return "Clean embedded text — no OCR needed."
+    if r.pages_via_text == 0 and r.avg_page_score >= 60:
+        return "Scanned source — OCR used on every page."
+    if r.pages_via_ocr > r.pages_via_text * 2 and r.pages_via_ocr > 0:
+        return (
+            f"Broken text layer — recovered via OCR on "
+            f"{r.pages_via_ocr} pages."
+        )
+    total = r.pages_via_text + r.pages_via_ocr
+    if total == 0:
+        return "No pages extracted."
+    text_pct = 100 * r.pages_via_text / total
+    ocr_pct = 100 * r.pages_via_ocr / total
+    return f"Mixed: {text_pct:.0f}% text, {ocr_pct:.0f}% OCR."
 
 
 # ─── EPUB ────────────────────────────────────────────────────────────────────
@@ -793,6 +868,11 @@ def extract_epub(epub_path: Path) -> BookResult:
     result.markdown = "\n\n".join(chunks)
     result.word_count = sum(score_text_quality(c).word_count for c in chunks)
     result.pages_via_text = result.pages_extracted  # all text for EPUBs
+    result.reason = (
+        f"EPUB — {result.pages_extracted} chapters extracted via HTML parsing."
+        if result.pages_extracted > 0
+        else "EPUB had no extractable chapters."
+    )
     return result
 
 
@@ -818,8 +898,12 @@ def write_markdown(book: BookResult, out_path: Path) -> None:
         f"> Words: {book.word_count:,} "
         f"| Avg page quality score: {book.avg_page_score:.0f}/100",
     ]
+    if book.reason:
+        header.append(f"> Note: {book.reason}")
     if book.warnings_:
         header.append("> Warnings: " + "; ".join(book.warnings_))
+    if book.ocr_errors:
+        header.append(f"> OCR exceptions: {len(book.ocr_errors)} pages")
     header.extend(["", "---", "", ""])
     out_path.write_text("\n".join(header) + book.markdown, encoding="utf-8")
 
