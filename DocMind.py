@@ -58,19 +58,78 @@ COLOR_DROP_ACTIVE = "#3a2f22"
 # WORKER THREAD
 # ═══════════════════════════════════════════════════════════════════════════
 
+SUPPORTED_EXTENSIONS = (".pdf", ".epub")
+_STOP_SENTINEL = "__docmind_stopped__"
+
+
+def _format_eta(seconds: float) -> str:
+    """Compact ETA string: '42s', '3m 12s', '1h 5m', '…' if unknown."""
+    if seconds is None or seconds < 0 or seconds != seconds:
+        return "…"
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s"
+    return f"{s // 3600}h {(s % 3600) // 60}m"
+
+
+def collect_files(sources: list[Path]) -> list[Path]:
+    """Flatten a mix of files and folders into a sorted list of PDFs/EPUBs.
+
+    Folders are expanded one level deep (non-recursive) — matching the
+    original folder-drop behaviour. Duplicate paths are de-duplicated.
+    """
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for s in sources:
+        s = Path(s)
+        if s.is_file() and s.suffix.lower() in SUPPORTED_EXTENSIONS:
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+        elif s.is_dir():
+            for child in sorted(s.iterdir()):
+                if (child.is_file()
+                        and child.suffix.lower() in SUPPORTED_EXTENSIONS
+                        and child not in seen):
+                    seen.add(child)
+                    out.append(child)
+    return out
+
+
 class ExtractionWorker(QThread):
-    """Runs extraction in a background thread. Emits signals for UI updates."""
+    """Background extraction runner with per-page progress and EPUB support.
+
+    Signals
+    -------
+    file_started(filename)
+        About to process this file.
+    file_progress(filename, pages_done, total_pages, eta_str)
+        Per-page tick during PDF extraction. EPUB emits one 0/1 then 1/1 tick.
+    file_finished(filename, pages_extracted, total_pages, word_count,
+                  avg_score, grade, reason)
+        File completed (or failed). `reason` is the human-readable note
+        from BookResult.reason; empty string for failures.
+    progress(overall_pct, status_text)
+        Overall run progress across all files.
+    finished_all(summary_text)
+        All files finished.
+    error(message)
+        Fatal error — run aborted.
+    """
 
     file_started = Signal(str)
-    file_finished = Signal(str, int, int, int, float, str)
+    file_progress = Signal(str, int, int, str)
+    file_finished = Signal(str, int, int, int, float, str, str)
     progress = Signal(int, str)
     finished_all = Signal(str)
     error = Signal(str)
 
-    def __init__(self, source_folder: Path, output_folder: Path,
+    def __init__(self, files: list[Path], output_folder: Path,
                  force_ocr: bool = False):
         super().__init__()
-        self.source_folder = source_folder
+        self.files = list(files)
         self.output_folder = output_folder
         self.force_ocr = force_ocr
         self._stopped = False
@@ -82,50 +141,52 @@ class ExtractionWorker(QThread):
         try:
             self.output_folder.mkdir(parents=True, exist_ok=True)
 
-            files = sorted(
-                f for f in self.source_folder.iterdir()
-                if f.suffix.lower() == ".pdf"
-            )
-
-            if not files:
-                self.error.emit(
-                    f"No PDF files found in:\n{self.source_folder}"
-                )
+            if not self.files:
+                self.error.emit("No PDF or EPUB files to process.")
                 return
 
             self.progress.emit(
-                0, f"Found {len(files)} PDF{'s' if len(files) != 1 else ''}"
+                0,
+                f"Found {len(self.files)} "
+                f"file{'s' if len(self.files) != 1 else ''}",
             )
 
             results = []
-            start = time.time()
+            run_start = time.monotonic()
 
-            for i, f in enumerate(files):
+            for i, f in enumerate(self.files):
                 if self._stopped:
                     self.progress.emit(0, "Stopped.")
                     return
 
                 self.file_started.emit(f.name)
-                pct = int(100 * i / len(files))
+                overall_pct = int(100 * i / len(self.files))
                 self.progress.emit(
-                    pct, f"[{i+1}/{len(files)}] {f.name[:60]}"
+                    overall_pct,
+                    f"[{i + 1}/{len(self.files)}] {f.name[:60]}",
                 )
 
                 try:
-                    out_path = self.output_folder / extract_v4.slugify(f.name)
-                    result = extract_v4.extract_pdf(
-                        f, force_ocr=self.force_ocr, verbose=False
-                    )
+                    result = self._process_one(f)
 
                     if result.pages_extracted > 0:
+                        out_path = self.output_folder / extract_v4.slugify(
+                            f.name
+                        )
                         extract_v4.write_markdown(result, out_path)
 
                     total = result.pages_extracted + result.pages_skipped
-                    grade = self._score_to_grade(result.avg_page_score,
-                                                 result.pages_extracted)
+                    grade = self._score_to_grade(
+                        result.avg_page_score, result.pages_extracted
+                    )
                     self.file_finished.emit(
-                        f.name, result.pages_extracted, total,
-                        result.word_count, result.avg_page_score, grade
+                        f.name,
+                        result.pages_extracted,
+                        total,
+                        result.word_count,
+                        result.avg_page_score,
+                        grade,
+                        result.reason or "",
                     )
                     results.append({
                         "file": f.name,
@@ -138,11 +199,17 @@ class ExtractionWorker(QThread):
                         "avg_score": result.avg_page_score,
                         "warnings": result.warnings_,
                         "issues": result.issues,
+                        "ocr_errors": list(result.ocr_errors),
+                        "reason": result.reason,
                     })
 
+                except _StoppedError:
+                    self.progress.emit(0, "Stopped.")
+                    return
                 except Exception as e:
+                    reason = f"Failed: {type(e).__name__}: {e}"
                     self.file_finished.emit(
-                        f.name, 0, 0, 0, 0.0, "FAILED"
+                        f.name, 0, 0, 0, 0.0, "FAILED", reason
                     )
                     results.append({
                         "file": f.name,
@@ -155,12 +222,60 @@ class ExtractionWorker(QThread):
                 self.output_folder / "_QC_REPORT.md", results
             )
 
-            elapsed = time.time() - start
+            elapsed = time.monotonic() - run_start
             summary = self._build_summary(results, elapsed)
             self.finished_all.emit(summary)
 
         except Exception as e:
             self.error.emit(f"{e}\n\n{traceback.format_exc()}")
+
+    def _process_one(self, f: Path):
+        """Dispatch to PDF or EPUB extraction with per-page callback."""
+        suffix = f.suffix.lower()
+        if suffix == ".epub":
+            # EPUB has no page-level granularity; two ticks are enough
+            # for the progress bar to show motion.
+            self.file_progress.emit(f.name, 0, 1, "…")
+            result = extract_v4.extract_epub(f)
+            self.file_progress.emit(f.name, 1, 1, "0s")
+            return result
+        if suffix == ".pdf":
+            # Per-file ETA state, closed-over by the callback
+            eta_state = {"t_start": None, "smoothed_rate": None}
+
+            def cb(pages_done: int, total_pages: int):
+                if self._stopped:
+                    raise _StoppedError()
+                now = time.monotonic()
+                if eta_state["t_start"] is None:
+                    eta_state["t_start"] = now
+                    eta_str = "…"
+                else:
+                    elapsed = max(0.001, now - eta_state["t_start"])
+                    raw_rate = pages_done / elapsed
+                    prev = eta_state["smoothed_rate"]
+                    smoothed = (
+                        raw_rate
+                        if prev is None
+                        else 0.25 * raw_rate + 0.75 * prev
+                    )
+                    eta_state["smoothed_rate"] = smoothed
+                    remaining = max(0, total_pages - pages_done)
+                    eta_seconds = (
+                        remaining / smoothed if smoothed > 0 else 0
+                    )
+                    eta_str = _format_eta(eta_seconds)
+                self.file_progress.emit(
+                    f.name, pages_done, total_pages, eta_str
+                )
+
+            return extract_v4.extract_pdf(
+                f,
+                force_ocr=self.force_ocr,
+                verbose=False,
+                progress_callback=cb,
+            )
+        raise ValueError(f"Unsupported file type: {suffix}")
 
     @staticmethod
     def _score_to_grade(score: float, pages: int) -> str:
@@ -174,12 +289,18 @@ class ExtractionWorker(QThread):
 
     @staticmethod
     def _build_summary(results: list, elapsed: float) -> str:
-        good = sum(1 for r in results
-                   if r.get("avg_score", 0) >= 60 and not r.get("issues"))
-        review = sum(1 for r in results
-                     if 40 <= r.get("avg_score", 0) < 60 and not r.get("issues"))
-        poor = sum(1 for r in results
-                   if r.get("avg_score", 0) < 40 or r.get("issues"))
+        good = sum(
+            1 for r in results
+            if r.get("avg_score", 0) >= 60 and not r.get("issues")
+        )
+        review = sum(
+            1 for r in results
+            if 40 <= r.get("avg_score", 0) < 60 and not r.get("issues")
+        )
+        poor = sum(
+            1 for r in results
+            if r.get("avg_score", 0) < 40 or r.get("issues")
+        )
         total_words = sum(r.get("word_count", 0) for r in results)
         mins = int(elapsed // 60)
         secs = int(elapsed % 60)
@@ -188,6 +309,10 @@ class ExtractionWorker(QThread):
             f"✓ {good} good   ⚠ {review} review   ✗ {poor} failed\n"
             f"{total_words:,} words extracted total."
         )
+
+
+class _StoppedError(Exception):
+    """Raised by the page callback to unwind out of extract_pdf."""
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -286,11 +411,18 @@ class DropZone(QLabel):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class FileRow(QFrame):
-    """One row per PDF in the progress list."""
+    """One row per file in the progress list.
+
+    Layout (vertical):
+        top row   : [icon]  [filename] ............... [stats]
+        bar row   :         [==thin progress bar==] [ETA]
+        bottom    :         [italic reason / error message]
+    """
 
     STATUS_WAITING = "waiting"
     STATUS_RUNNING = "running"
     STATUS_DONE = "done"
+    STATUS_FAILED = "failed"
 
     def __init__(self, filename: str):
         super().__init__()
@@ -303,10 +435,16 @@ class FileRow(QFrame):
                 border: 1px solid {COLOR_BORDER};
                 border-radius: 8px;
             }}
+            QFrame > QLabel,
+            QFrame > QProgressBar {{ border: none; background: transparent; }}
         """)
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 10, 14, 10)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 10, 14, 10)
+        outer.setSpacing(4)
+
+        top = QHBoxLayout()
+        top.setSpacing(10)
 
         self.icon_label = QLabel("○")
         self.icon_label.setFixedWidth(24)
@@ -328,9 +466,40 @@ class FileRow(QFrame):
         )
         self.stats_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
-        layout.addWidget(self.icon_label)
-        layout.addWidget(self.name_label)
-        layout.addWidget(self.stats_label)
+        top.addWidget(self.icon_label)
+        top.addWidget(self.name_label)
+        top.addWidget(self.stats_label)
+        outer.addLayout(top)
+
+        bar_row = QHBoxLayout()
+        bar_row.setContentsMargins(34, 0, 0, 0)
+        bar_row.setSpacing(8)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(6)
+        self.progress_bar.setRange(0, 1000)  # finer resolution than 0–100
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        self.eta_label = QLabel("")
+        self.eta_label.setStyleSheet(
+            f"color: {COLOR_TEXT_DIM}; font-size: 11px; border: none;"
+        )
+        self.eta_label.setFixedWidth(90)
+        self.eta_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.eta_label.setVisible(False)
+        bar_row.addWidget(self.progress_bar, stretch=1)
+        bar_row.addWidget(self.eta_label)
+        outer.addLayout(bar_row)
+
+        self.reason_label = QLabel("")
+        self.reason_label.setWordWrap(True)
+        self.reason_label.setContentsMargins(34, 0, 0, 0)
+        self.reason_label.setStyleSheet(
+            f"color: {COLOR_TEXT_DIM}; font-size: 11px; "
+            "font-style: italic; border: none;"
+        )
+        self.reason_label.setVisible(False)
+        outer.addWidget(self.reason_label)
 
     def set_running(self):
         self.status = self.STATUS_RUNNING
@@ -338,29 +507,69 @@ class FileRow(QFrame):
         self.icon_label.setStyleSheet(
             f"color: {COLOR_ACCENT}; font-size: 18px; border: none;"
         )
-        self.stats_label.setText("working...")
+        self.stats_label.setText("starting...")
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self.eta_label.setText("…")
+        self.eta_label.setVisible(True)
+        self.reason_label.setVisible(False)
+
+    def set_progress(self, pages_done: int, total_pages: int, eta_str: str):
+        if self.status != self.STATUS_RUNNING:
+            self.set_running()
+        if total_pages > 0:
+            self.progress_bar.setValue(
+                int(1000 * pages_done / total_pages)
+            )
+        self.stats_label.setText(
+            f"{pages_done}/{total_pages} pages"
+        )
+        self.eta_label.setText(f"ETA {eta_str}")
 
     def set_done(self, pages: int, total_pages: int, words: int,
-                 score: float, grade: str):
+                 score: float, grade: str, reason: str = ""):
+        if grade == "FAILED":
+            self.status = self.STATUS_FAILED
+            self.icon_label.setText("✗")
+            self.icon_label.setStyleSheet(
+                f"color: {COLOR_ERROR}; font-size: 18px; border: none;"
+            )
+            self.progress_bar.setVisible(False)
+            self.eta_label.setVisible(False)
+            self.stats_label.setText("failed")
+            if reason:
+                self.reason_label.setText(reason)
+                self.reason_label.setStyleSheet(
+                    f"color: {COLOR_ERROR}; font-size: 11px; "
+                    "font-style: italic; border: none;"
+                )
+                self.reason_label.setVisible(True)
+            return
+
         self.status = self.STATUS_DONE
+        self.icon_label.setText("●")
         if grade == "GOOD":
-            self.icon_label.setText("●")
             color = COLOR_SUCCESS
         elif grade == "REVIEW":
-            self.icon_label.setText("●")
             color = COLOR_WARNING
         else:
-            self.icon_label.setText("✗")
             color = COLOR_ERROR
         self.icon_label.setStyleSheet(
             f"color: {color}; font-size: 18px; border: none;"
         )
-        if grade == "FAILED":
-            self.stats_label.setText("failed")
-        else:
-            self.stats_label.setText(
-                f"{pages}/{total_pages} pages  ·  {words:,} words  ·  {score:.0f}/100"
+        self.progress_bar.setValue(1000)
+        self.eta_label.setText("done")
+        self.stats_label.setText(
+            f"{pages}/{total_pages} pages  ·  "
+            f"{words:,} words  ·  {score:.0f}/100"
+        )
+        if reason:
+            self.reason_label.setText(reason)
+            self.reason_label.setStyleSheet(
+                f"color: {COLOR_TEXT_DIM}; font-size: 11px; "
+                "font-style: italic; border: none;"
             )
+            self.reason_label.setVisible(True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -569,11 +778,15 @@ class DocMindWindow(QMainWindow):
             return
         output_folder = self.source_folder / "extracted"
 
+        files = collect_files([self.source_folder])
+        if not files:
+            self.status_label.setText(
+                "No PDF or EPUB files found in that folder."
+            )
+            self.status_label.setVisible(True)
+            return
+
         self._clear_file_list()
-        files = sorted(
-            f for f in self.source_folder.iterdir()
-            if f.suffix.lower() == ".pdf"
-        )
         for f in files:
             row = FileRow(f.name)
             self.file_rows[f.name] = row
@@ -593,11 +806,12 @@ class DocMindWindow(QMainWindow):
         self.force_ocr_check.setEnabled(False)
 
         self.worker = ExtractionWorker(
-            self.source_folder,
+            files,
             output_folder,
             force_ocr=self.force_ocr_check.isChecked(),
         )
         self.worker.file_started.connect(self._on_file_started)
+        self.worker.file_progress.connect(self._on_file_progress)
         self.worker.file_finished.connect(self._on_file_finished)
         self.worker.progress.connect(self._on_progress)
         self.worker.finished_all.connect(self._on_finished_all)
@@ -615,11 +829,18 @@ class DocMindWindow(QMainWindow):
         if row:
             row.set_running()
 
-    def _on_file_finished(self, filename: str, pages: int, total: int,
-                          words: int, score: float, grade: str):
+    def _on_file_progress(self, filename: str, pages_done: int,
+                          total_pages: int, eta_str: str):
         row = self.file_rows.get(filename)
         if row:
-            row.set_done(pages, total, words, score, grade)
+            row.set_progress(pages_done, total_pages, eta_str)
+
+    def _on_file_finished(self, filename: str, pages: int, total: int,
+                          words: int, score: float, grade: str,
+                          reason: str):
+        row = self.file_rows.get(filename)
+        if row:
+            row.set_done(pages, total, words, score, grade, reason)
 
     def _on_progress(self, pct: int, text: str):
         self.progress_bar.setValue(pct)
