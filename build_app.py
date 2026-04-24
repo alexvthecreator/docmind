@@ -34,6 +34,7 @@ OPTIONS = {
     "argv_emulation": False,
     "includes": [
         "extract_v4",
+        "skill_export",
         "fitz",
         "pdfplumber",
         "pytesseract",

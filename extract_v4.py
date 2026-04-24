@@ -64,9 +64,83 @@ except ImportError:
 try:
     import pytesseract
     from pdf2image import convert_from_path
-    pytesseract.get_tesseract_version()
 except Exception:
     MISSING.append("pytesseract/pdf2image/tesseract-binary")
+
+
+# ─── BUNDLED BINARY RESOLUTION ───────────────────────────────────────────────
+# When DocMind ships as a drag-to-Applications `.app`, tesseract lives inside
+# the bundle — we resolve it here so end-users never touch Homebrew or PATH.
+# Resolution order: $TESSERACT_CMD → bundled → system PATH fallback.
+
+
+def _find_bundled_tesseract() -> tuple[os.PathLike | None, os.PathLike | None]:
+    """Walk up from this file looking for a py2app-style .app bundle.
+
+    Returns (tesseract_binary, tessdata_dir) if found inside the bundle,
+    else (None, None). Works for `.app/Contents/Resources/.../extract_v4.py`.
+    """
+    here = os.path.abspath(__file__)
+    cur = os.path.dirname(here)
+    for _ in range(8):  # stop climbing after 8 levels; we never need more
+        contents = os.path.dirname(cur)  # e.g. .../DocMind.app/Contents
+        if os.path.basename(os.path.dirname(contents)).endswith(".app"):
+            res = os.path.join(contents, "Resources")
+            tcmd = os.path.join(res, "bin", "tesseract")
+            tdata = os.path.join(res, "tessdata")
+            if os.path.isfile(tcmd) and os.path.isdir(tdata):
+                return tcmd, tdata
+            return None, None
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return None, None
+
+
+def _configure_tesseract() -> None:
+    """Point pytesseract at the right tesseract binary and tessdata directory.
+
+    Priority:
+      1. $TESSERACT_CMD / $TESSDATA_PREFIX env vars (developer override)
+      2. Bundled inside the .app (end-user install)
+      3. System PATH (developer dev loop, Homebrew etc.)
+    """
+    if "pytesseract/pdf2image/tesseract-binary" in MISSING:
+        return
+
+    env_cmd = os.environ.get("TESSERACT_CMD")
+    if env_cmd and os.path.isfile(env_cmd):
+        pytesseract.pytesseract.tesseract_cmd = env_cmd
+    else:
+        bundled_cmd, bundled_data = _find_bundled_tesseract()
+        if bundled_cmd:
+            pytesseract.pytesseract.tesseract_cmd = str(bundled_cmd)
+            # tesseract looks for tessdata via TESSDATA_PREFIX or a sibling path.
+            if bundled_data and "TESSDATA_PREFIX" not in os.environ:
+                os.environ["TESSDATA_PREFIX"] = str(bundled_data)
+            # Also ensure bundled dylibs are discoverable by the tesseract binary.
+            fw = os.path.normpath(
+                os.path.join(
+                    os.path.dirname(str(bundled_cmd)), "..", "..", "Frameworks"
+                )
+            )
+            if os.path.isdir(fw):
+                existing = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "")
+                if fw not in existing.split(os.pathsep):
+                    os.environ["DYLD_FALLBACK_LIBRARY_PATH"] = (
+                        fw + (os.pathsep + existing if existing else "")
+                    )
+
+    # Verify tesseract actually responds. If not, degrade gracefully.
+    try:
+        pytesseract.get_tesseract_version()
+    except Exception:
+        if "pytesseract/pdf2image/tesseract-binary" not in MISSING:
+            MISSING.append("pytesseract/pdf2image/tesseract-binary")
+
+
+_configure_tesseract()
 try:
     from PIL import Image
 except ImportError:
@@ -275,6 +349,14 @@ def score_text_quality(text: str) -> QualityScore:
         - 100 * garbage_ratio
         + count_bonus
     )
+
+    # E2: scrambled-ligature / broken-CMap detector.
+    # Real English always has >15% common words OR average word length >3.
+    # When both are low across 30+ tokens, it's almost certainly scrambled
+    # text from a broken ToUnicode CMap — demote the score so OCR wins.
+    if common_ratio < 0.15 and avg_len < 3.0 and word_count > 30:
+        score = score * 0.1
+
     score = max(0.0, min(100.0, score))
 
     return QualityScore(
@@ -421,6 +503,34 @@ def ocr_page(pil_image: "Image.Image") -> str:
         return ""
 
 
+# ─── OCR STARTUP SMOKE TEST ──────────────────────────────────────────────────
+
+def self_test_ocr() -> tuple[bool, str]:
+    """Quick end-to-end OCR check for app startup.
+
+    Generates a synthetic 200×60 image with the words 'Hello world', runs the
+    same OCR pipeline a real page would, and checks for either word in the
+    output. Returns (True, '') on success or (False, error_repr) on any
+    failure — a missing tesseract binary, a broken pytesseract install, a
+    language pack absent, etc. The UI calls this on launch and shows a
+    persistent banner if OCR is unavailable, so the user doesn't waste 20
+    minutes on an unrecoverable run.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        img = Image.new("RGB", (300, 80), color="white")
+        draw = ImageDraw.Draw(img)
+        # Use default bitmap font — always available, no filesystem assumptions
+        draw.text((20, 25), "Hello world", fill="black")
+        out = pytesseract.image_to_string(img, lang="eng", config="--oem 1 --psm 6")
+        out_lower = (out or "").lower()
+        if "hello" in out_lower or "world" in out_lower:
+            return True, ""
+        return False, f"OCR ran but returned unexpected output: {out!r}"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
 # ─── PDF → PAGE IMAGES (streaming) ───────────────────────────────────────────
 
 def pdf_page_to_image(doc, page_idx: int, dpi: int = 300) -> "Image.Image":
@@ -490,6 +600,7 @@ class PageResult:
     score: QualityScore
     text_score: QualityScore | None = None
     ocr_score: QualityScore | None = None
+    ocr_error: str | None = None   # set when OCR was attempted and threw
 
 
 def extract_page(
@@ -529,16 +640,39 @@ def extract_page(
         )
 
     # Step 3: OCR
+    ocr_error: str | None = None
     try:
         image = pdf_page_to_image(doc, page_idx, dpi=300)
         ocr_raw = ocr_page(image)
         ocr_normalized = normalize_encoding(ocr_raw)
         ocr_score = score_text_quality(ocr_normalized)
-    except Exception:
+    except Exception as e:
+        # E1: surface the exception instead of swallowing it silently
+        ocr_error = f"{type(e).__name__}: {e}"
         ocr_normalized = ""
-        ocr_score = QualityScore(0.0, 0, 0.0, 1.0, 0.0, "ocr exception")
+        ocr_score = QualityScore(
+            0.0, 0, 0.0, 1.0, 0.0, f"ocr exception: {type(e).__name__}"
+        )
 
     # Step 4: pick the winner
+    # E3: decision rule hardening — if the text layer has near-zero real English
+    # (broken ToUnicode CMap, scrambled ligatures) and OCR looks plausible,
+    # OCR wins regardless of raw score margin.
+    if (
+        text_score.common_word_ratio < 0.10
+        and ocr_score.common_word_ratio > 0.30
+        and ocr_normalized.strip()
+    ):
+        return PageResult(
+            page_num=page_num,
+            method="ocr",
+            text=ocr_normalized,
+            score=ocr_score,
+            text_score=text_score,
+            ocr_score=ocr_score,
+            ocr_error=ocr_error,
+        )
+
     if ocr_score.score > text_score.score + 5:
         # OCR won by a meaningful margin
         return PageResult(
@@ -548,6 +682,7 @@ def extract_page(
             score=ocr_score,
             text_score=text_score,
             ocr_score=ocr_score,
+            ocr_error=ocr_error,
         )
     elif text_score.score > 0:
         return PageResult(
@@ -557,6 +692,7 @@ def extract_page(
             score=text_score,
             text_score=text_score,
             ocr_score=ocr_score,
+            ocr_error=ocr_error,
         )
     elif ocr_score.score > 0:
         return PageResult(
@@ -566,6 +702,7 @@ def extract_page(
             score=ocr_score,
             text_score=text_score,
             ocr_score=ocr_score,
+            ocr_error=ocr_error,
         )
     else:
         return PageResult(
@@ -573,6 +710,7 @@ def extract_page(
             method="none",
             text="",
             score=text_score,
+            ocr_error=ocr_error,
         )
 
 
@@ -625,6 +763,8 @@ class BookResult:
     markdown: str = ""
     issues: list[str] = field(default_factory=list)
     warnings_: list[str] = field(default_factory=list)
+    ocr_errors: list[str] = field(default_factory=list)  # "p{N}: {ExcType}: {msg}"
+    reason: str = ""
 
 
 def extract_pdf(
@@ -632,8 +772,14 @@ def extract_pdf(
     force_ocr: bool = False,
     verbose: bool = True,
     progress_prefix: str = "",
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> BookResult:
-    """Extract an entire PDF to clean Markdown for LLM consumption."""
+    """Extract an entire PDF to clean Markdown for LLM consumption.
+
+    If progress_callback is provided, it is invoked after each page with
+    (pages_done, total_pages). The callback may raise to request early
+    termination — the exception propagates up and the caller handles it.
+    """
     result = BookResult(path=pdf_path)
 
     try:
@@ -662,8 +808,15 @@ def extract_pdf(
                 f"(last: {pr.method}, score {pr.score.score:.0f})",
                 file=sys.stderr,
             )
+        if progress_callback is not None:
+            progress_callback(idx + 1, n_pages)
 
     doc.close()
+
+    # Collect OCR exception reports from individual pages
+    for pr in page_results:
+        if pr.ocr_error:
+            result.ocr_errors.append(f"p{pr.page_num}: {pr.ocr_error}")
 
     # Strip running boilerplate across all pages
     boilerplate = detect_running_boilerplate(page_results)
@@ -707,7 +860,46 @@ def extract_pdf(
             f"({result.pages_extracted})"
         )
 
+    # E4: human-readable reason explaining why this book scored the way it did.
+    # First match wins; order matters (most urgent/diagnostic first).
+    result.reason = _reason_for_book(result)
+
     return result
+
+
+def _reason_for_book(r: BookResult) -> str:
+    """Produce a one-line human-readable explanation of the extraction outcome."""
+    if r.ocr_errors:
+        # Surface the first exception type so the user has a pointer to the cause
+        first = r.ocr_errors[0]
+        # Format is "p{N}: {ExcType}: {msg}" — pull the exception type
+        try:
+            exc_type = first.split(": ", 2)[1]
+        except IndexError:
+            exc_type = "error"
+        return (
+            f"OCR failed on {len(r.ocr_errors)} pages ({exc_type}) — "
+            "text layer used as fallback."
+        )
+    if r.pages_extracted == 0:
+        return "No pages extracted — source may be empty, encrypted, or unreadable."
+    if r.avg_page_score < 40:
+        return "Low-quality source — review recommended."
+    if r.pages_via_ocr == 0 and r.avg_page_score >= 60:
+        return "Clean embedded text — no OCR needed."
+    if r.pages_via_text == 0 and r.avg_page_score >= 60:
+        return "Scanned source — OCR used on every page."
+    if r.pages_via_ocr > r.pages_via_text * 2 and r.pages_via_ocr > 0:
+        return (
+            f"Broken text layer — recovered via OCR on "
+            f"{r.pages_via_ocr} pages."
+        )
+    total = r.pages_via_text + r.pages_via_ocr
+    if total == 0:
+        return "No pages extracted."
+    text_pct = 100 * r.pages_via_text / total
+    ocr_pct = 100 * r.pages_via_ocr / total
+    return f"Mixed: {text_pct:.0f}% text, {ocr_pct:.0f}% OCR."
 
 
 # ─── EPUB ────────────────────────────────────────────────────────────────────
@@ -750,6 +942,11 @@ def extract_epub(epub_path: Path) -> BookResult:
     result.markdown = "\n\n".join(chunks)
     result.word_count = sum(score_text_quality(c).word_count for c in chunks)
     result.pages_via_text = result.pages_extracted  # all text for EPUBs
+    result.reason = (
+        f"EPUB — {result.pages_extracted} chapters extracted via HTML parsing."
+        if result.pages_extracted > 0
+        else "EPUB had no extractable chapters."
+    )
     return result
 
 
@@ -775,8 +972,12 @@ def write_markdown(book: BookResult, out_path: Path) -> None:
         f"> Words: {book.word_count:,} "
         f"| Avg page quality score: {book.avg_page_score:.0f}/100",
     ]
+    if book.reason:
+        header.append(f"> Note: {book.reason}")
     if book.warnings_:
         header.append("> Warnings: " + "; ".join(book.warnings_))
+    if book.ocr_errors:
+        header.append(f"> OCR exceptions: {len(book.ocr_errors)} pages")
     header.extend(["", "---", "", ""])
     out_path.write_text("\n".join(header) + book.markdown, encoding="utf-8")
 
@@ -826,6 +1027,8 @@ def process_one_book(
         "avg_score": book.avg_page_score,
         "warnings": book.warnings_,
         "issues": book.issues,
+        "ocr_errors": book.ocr_errors,
+        "reason": book.reason,
     }
 
 
@@ -913,13 +1116,30 @@ def write_qc_report(path: Path, results: list[dict]) -> None:
                 continue
             score = r.get("avg_score", 0)
             grade = "✅ GOOD" if score >= 60 else ("⚠️ REVIEW" if score >= 40 else "❌ POOR")
-            notes = "; ".join(r.get("warnings", [])) or "—"
+            note_parts = list(r.get("warnings", []))
+            if r.get("reason"):
+                note_parts.append(r["reason"])
+            if r.get("ocr_errors"):
+                note_parts.append(f"{len(r['ocr_errors'])} OCR errors")
+            notes = "; ".join(note_parts) or "—"
             f.write(
                 f"| {n} | {r['file'][:40]} | {r.get('pages_extracted', 0)} | "
                 f"{r.get('pages_via_text', 0)} | {r.get('pages_via_ocr', 0)} | "
                 f"{r.get('pages_skipped', 0)} | {r.get('word_count', 0):,} | "
                 f"{score:.0f} | {grade} | {notes} |\n"
             )
+
+        # Per-book OCR-error detail appendix (only if any book had errors)
+        books_with_ocr_errors = [r for r in results if r.get("ocr_errors")]
+        if books_with_ocr_errors:
+            f.write("\n---\n\n## OCR exceptions (detail)\n\n")
+            for r in books_with_ocr_errors:
+                f.write(f"### {r['file']}\n\n")
+                for err in r["ocr_errors"][:50]:
+                    f.write(f"- {err}\n")
+                if len(r["ocr_errors"]) > 50:
+                    f.write(f"- … and {len(r['ocr_errors']) - 50} more\n")
+                f.write("\n")
 
 
 # ─── MAIN ────────────────────────────────────────────────────────────────────

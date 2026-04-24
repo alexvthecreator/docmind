@@ -26,7 +26,9 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QProgressBar, QTextEdit, QFileDialog,
-    QFrame, QSizePolicy, QScrollArea, QCheckBox,
+    QFrame, QSizePolicy, QScrollArea, QCheckBox, QMenu,
+    QDialog, QComboBox, QLineEdit, QPlainTextEdit, QListWidget,
+    QListWidgetItem, QDialogButtonBox,
 )
 
 # Import the extraction engine. extract_v4.py must sit next to this file.
@@ -35,6 +37,12 @@ try:
 except ImportError:
     print("ERROR: extract_v4.py must be in the same folder as DocMind.py")
     sys.exit(1)
+
+# Skill-export helper — pooling references + writing target-shaped prompts.
+try:
+    import skill_export
+except ImportError:
+    skill_export = None  # type: ignore
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -58,19 +66,78 @@ COLOR_DROP_ACTIVE = "#3a2f22"
 # WORKER THREAD
 # ═══════════════════════════════════════════════════════════════════════════
 
+SUPPORTED_EXTENSIONS = (".pdf", ".epub")
+_STOP_SENTINEL = "__docmind_stopped__"
+
+
+def _format_eta(seconds: float) -> str:
+    """Compact ETA string: '42s', '3m 12s', '1h 5m', '…' if unknown."""
+    if seconds is None or seconds < 0 or seconds != seconds:
+        return "…"
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s"
+    return f"{s // 3600}h {(s % 3600) // 60}m"
+
+
+def collect_files(sources: list[Path]) -> list[Path]:
+    """Flatten a mix of files and folders into a sorted list of PDFs/EPUBs.
+
+    Folders are expanded one level deep (non-recursive) — matching the
+    original folder-drop behaviour. Duplicate paths are de-duplicated.
+    """
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for s in sources:
+        s = Path(s)
+        if s.is_file() and s.suffix.lower() in SUPPORTED_EXTENSIONS:
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+        elif s.is_dir():
+            for child in sorted(s.iterdir()):
+                if (child.is_file()
+                        and child.suffix.lower() in SUPPORTED_EXTENSIONS
+                        and child not in seen):
+                    seen.add(child)
+                    out.append(child)
+    return out
+
+
 class ExtractionWorker(QThread):
-    """Runs extraction in a background thread. Emits signals for UI updates."""
+    """Background extraction runner with per-page progress and EPUB support.
+
+    Signals
+    -------
+    file_started(filename)
+        About to process this file.
+    file_progress(filename, pages_done, total_pages, eta_str)
+        Per-page tick during PDF extraction. EPUB emits one 0/1 then 1/1 tick.
+    file_finished(filename, pages_extracted, total_pages, word_count,
+                  avg_score, grade, reason)
+        File completed (or failed). `reason` is the human-readable note
+        from BookResult.reason; empty string for failures.
+    progress(overall_pct, status_text)
+        Overall run progress across all files.
+    finished_all(summary_text)
+        All files finished.
+    error(message)
+        Fatal error — run aborted.
+    """
 
     file_started = Signal(str)
-    file_finished = Signal(str, int, int, int, float, str)
+    file_progress = Signal(str, int, int, str)
+    file_finished = Signal(str, int, int, int, float, str, str)
     progress = Signal(int, str)
     finished_all = Signal(str)
     error = Signal(str)
 
-    def __init__(self, source_folder: Path, output_folder: Path,
+    def __init__(self, files: list[Path], output_folder: Path,
                  force_ocr: bool = False):
         super().__init__()
-        self.source_folder = source_folder
+        self.files = list(files)
         self.output_folder = output_folder
         self.force_ocr = force_ocr
         self._stopped = False
@@ -82,50 +149,52 @@ class ExtractionWorker(QThread):
         try:
             self.output_folder.mkdir(parents=True, exist_ok=True)
 
-            files = sorted(
-                f for f in self.source_folder.iterdir()
-                if f.suffix.lower() == ".pdf"
-            )
-
-            if not files:
-                self.error.emit(
-                    f"No PDF files found in:\n{self.source_folder}"
-                )
+            if not self.files:
+                self.error.emit("No PDF or EPUB files to process.")
                 return
 
             self.progress.emit(
-                0, f"Found {len(files)} PDF{'s' if len(files) != 1 else ''}"
+                0,
+                f"Found {len(self.files)} "
+                f"file{'s' if len(self.files) != 1 else ''}",
             )
 
             results = []
-            start = time.time()
+            run_start = time.monotonic()
 
-            for i, f in enumerate(files):
+            for i, f in enumerate(self.files):
                 if self._stopped:
                     self.progress.emit(0, "Stopped.")
                     return
 
                 self.file_started.emit(f.name)
-                pct = int(100 * i / len(files))
+                overall_pct = int(100 * i / len(self.files))
                 self.progress.emit(
-                    pct, f"[{i+1}/{len(files)}] {f.name[:60]}"
+                    overall_pct,
+                    f"[{i + 1}/{len(self.files)}] {f.name[:60]}",
                 )
 
                 try:
-                    out_path = self.output_folder / extract_v4.slugify(f.name)
-                    result = extract_v4.extract_pdf(
-                        f, force_ocr=self.force_ocr, verbose=False
-                    )
+                    result = self._process_one(f)
 
                     if result.pages_extracted > 0:
+                        out_path = self.output_folder / extract_v4.slugify(
+                            f.name
+                        )
                         extract_v4.write_markdown(result, out_path)
 
                     total = result.pages_extracted + result.pages_skipped
-                    grade = self._score_to_grade(result.avg_page_score,
-                                                 result.pages_extracted)
+                    grade = self._score_to_grade(
+                        result.avg_page_score, result.pages_extracted
+                    )
                     self.file_finished.emit(
-                        f.name, result.pages_extracted, total,
-                        result.word_count, result.avg_page_score, grade
+                        f.name,
+                        result.pages_extracted,
+                        total,
+                        result.word_count,
+                        result.avg_page_score,
+                        grade,
+                        result.reason or "",
                     )
                     results.append({
                         "file": f.name,
@@ -138,11 +207,17 @@ class ExtractionWorker(QThread):
                         "avg_score": result.avg_page_score,
                         "warnings": result.warnings_,
                         "issues": result.issues,
+                        "ocr_errors": list(result.ocr_errors),
+                        "reason": result.reason,
                     })
 
+                except _StoppedError:
+                    self.progress.emit(0, "Stopped.")
+                    return
                 except Exception as e:
+                    reason = f"Failed: {type(e).__name__}: {e}"
                     self.file_finished.emit(
-                        f.name, 0, 0, 0, 0.0, "FAILED"
+                        f.name, 0, 0, 0, 0.0, "FAILED", reason
                     )
                     results.append({
                         "file": f.name,
@@ -155,12 +230,60 @@ class ExtractionWorker(QThread):
                 self.output_folder / "_QC_REPORT.md", results
             )
 
-            elapsed = time.time() - start
+            elapsed = time.monotonic() - run_start
             summary = self._build_summary(results, elapsed)
             self.finished_all.emit(summary)
 
         except Exception as e:
             self.error.emit(f"{e}\n\n{traceback.format_exc()}")
+
+    def _process_one(self, f: Path):
+        """Dispatch to PDF or EPUB extraction with per-page callback."""
+        suffix = f.suffix.lower()
+        if suffix == ".epub":
+            # EPUB has no page-level granularity; two ticks are enough
+            # for the progress bar to show motion.
+            self.file_progress.emit(f.name, 0, 1, "…")
+            result = extract_v4.extract_epub(f)
+            self.file_progress.emit(f.name, 1, 1, "0s")
+            return result
+        if suffix == ".pdf":
+            # Per-file ETA state, closed-over by the callback
+            eta_state = {"t_start": None, "smoothed_rate": None}
+
+            def cb(pages_done: int, total_pages: int):
+                if self._stopped:
+                    raise _StoppedError()
+                now = time.monotonic()
+                if eta_state["t_start"] is None:
+                    eta_state["t_start"] = now
+                    eta_str = "…"
+                else:
+                    elapsed = max(0.001, now - eta_state["t_start"])
+                    raw_rate = pages_done / elapsed
+                    prev = eta_state["smoothed_rate"]
+                    smoothed = (
+                        raw_rate
+                        if prev is None
+                        else 0.25 * raw_rate + 0.75 * prev
+                    )
+                    eta_state["smoothed_rate"] = smoothed
+                    remaining = max(0, total_pages - pages_done)
+                    eta_seconds = (
+                        remaining / smoothed if smoothed > 0 else 0
+                    )
+                    eta_str = _format_eta(eta_seconds)
+                self.file_progress.emit(
+                    f.name, pages_done, total_pages, eta_str
+                )
+
+            return extract_v4.extract_pdf(
+                f,
+                force_ocr=self.force_ocr,
+                verbose=False,
+                progress_callback=cb,
+            )
+        raise ValueError(f"Unsupported file type: {suffix}")
 
     @staticmethod
     def _score_to_grade(score: float, pages: int) -> str:
@@ -174,12 +297,18 @@ class ExtractionWorker(QThread):
 
     @staticmethod
     def _build_summary(results: list, elapsed: float) -> str:
-        good = sum(1 for r in results
-                   if r.get("avg_score", 0) >= 60 and not r.get("issues"))
-        review = sum(1 for r in results
-                     if 40 <= r.get("avg_score", 0) < 60 and not r.get("issues"))
-        poor = sum(1 for r in results
-                   if r.get("avg_score", 0) < 40 or r.get("issues"))
+        good = sum(
+            1 for r in results
+            if r.get("avg_score", 0) >= 60 and not r.get("issues")
+        )
+        review = sum(
+            1 for r in results
+            if 40 <= r.get("avg_score", 0) < 60 and not r.get("issues")
+        )
+        poor = sum(
+            1 for r in results
+            if r.get("avg_score", 0) < 40 or r.get("issues")
+        )
         total_words = sum(r.get("word_count", 0) for r in results)
         mins = int(elapsed // 60)
         secs = int(elapsed % 60)
@@ -190,12 +319,18 @@ class ExtractionWorker(QThread):
         )
 
 
+class _StoppedError(Exception):
+    """Raised by the page callback to unwind out of extract_pdf."""
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # DROP ZONE
 # ═══════════════════════════════════════════════════════════════════════════
 
 class DropZone(QLabel):
-    folder_dropped = Signal(Path)
+    """Accepts drag-drop or click-to-pick of PDFs, EPUBs, folders, or any mix."""
+
+    items_dropped = Signal(list)  # list[Path]
 
     def __init__(self):
         super().__init__()
@@ -203,82 +338,144 @@ class DropZone(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumHeight(280)
         self.setWordWrap(True)
+        self._processing = False
         self._set_idle()
+
+    # ── State displays ──────────────────────────────────────────────────
 
     def _set_idle(self):
         self.setText(
             "📄\n\n"
-            "Drop a folder of PDFs here\n\n"
-            "or click to browse\n\n"
+            "Drop PDFs, EPUBs, or a folder here\n\n"
+            "or click to pick files / folder\n\n"
             "\n"
-            "PDF files only"
+            "PDF and EPUB files"
         )
         self.setStyleSheet(self._style(active=False))
 
     def _set_active(self):
-        self.setText("📥\n\nRelease to load these PDFs")
+        self.setText("📥\n\nRelease to start extraction")
         self.setStyleSheet(self._style(active=True))
 
-    def _set_loaded(self, folder: Path, count: int):
-        plural = "s" if count != 1 else ""
+    def _set_processing(self):
         self.setText(
-            f"✓\n\n"
-            f"{folder.name}\n"
-            f"{count} PDF{plural} ready\n\n"
-            f"Click to choose a different folder"
+            "⏳\n\n"
+            "Extraction in progress\n\n"
+            "Drop more once the current batch completes"
         )
-        self.setStyleSheet(self._style(active=False, loaded=True))
+        self.setStyleSheet(self._style(active=False, disabled=True))
 
-    def _style(self, active=False, loaded=False):
-        if active:
+    def set_processing(self, on: bool):
+        """Called by the main window to lock/unlock the zone during a run."""
+        self._processing = on
+        if on:
+            self._set_processing()
+        else:
+            self._set_idle()
+
+    def _style(self, active=False, loaded=False, disabled=False):
+        if disabled:
+            border = COLOR_BORDER
+            bg = COLOR_BG
+            text = COLOR_TEXT_DIM
+        elif active:
             border = COLOR_ACCENT
             bg = COLOR_DROP_ACTIVE
+            text = COLOR_TEXT
         elif loaded:
             border = COLOR_ACCENT
             bg = COLOR_SURFACE
+            text = COLOR_TEXT
         else:
             border = COLOR_BORDER
             bg = COLOR_SURFACE
+            text = COLOR_TEXT
         return f"""
             QLabel {{
                 background-color: {bg};
                 border: 2px dashed {border};
                 border-radius: 16px;
-                color: {COLOR_TEXT};
+                color: {text};
                 font-size: 16px;
                 padding: 40px;
             }}
         """
 
+    # ── Drop-payload normalisation ──────────────────────────────────────
+
+    @staticmethod
+    def _paths_from_urls(urls) -> list[Path]:
+        """Return the subset of dropped URLs that are valid local PDFs,
+        EPUBs, or directories. Order preserved, duplicates removed."""
+        seen: set[Path] = set()
+        out: list[Path] = []
+        for u in urls:
+            local = u.toLocalFile()
+            if not local:
+                continue
+            p = Path(local)
+            if p in seen:
+                continue
+            if p.is_dir():
+                seen.add(p)
+                out.append(p)
+            elif p.is_file() and p.suffix.lower() in SUPPORTED_EXTENSIONS:
+                seen.add(p)
+                out.append(p)
+        return out
+
+    # ── Drag and drop events ────────────────────────────────────────────
+
     def dragEnterEvent(self, event: QDragEnterEvent):
-        if event.mimeData().hasUrls():
-            urls = event.mimeData().urls()
-            if len(urls) == 1 and urls[0].toLocalFile():
-                path = Path(urls[0].toLocalFile())
-                if path.is_dir():
-                    event.acceptProposedAction()
-                    self._set_active()
-                    return
-        event.ignore()
+        if self._processing or not event.mimeData().hasUrls():
+            event.ignore()
+            return
+        paths = self._paths_from_urls(event.mimeData().urls())
+        if paths:
+            event.acceptProposedAction()
+            self._set_active()
+        else:
+            event.ignore()
 
     def dragLeaveEvent(self, event):
-        self._set_idle()
+        if not self._processing:
+            self._set_idle()
 
     def dropEvent(self, event: QDropEvent):
-        urls = event.mimeData().urls()
-        if urls:
-            path = Path(urls[0].toLocalFile())
-            if path.is_dir():
-                self.folder_dropped.emit(path)
-                event.acceptProposedAction()
+        if self._processing:
+            event.ignore()
+            return
+        paths = self._paths_from_urls(event.mimeData().urls())
+        if paths:
+            event.acceptProposedAction()
+            self.items_dropped.emit(paths)
+
+    # ── Click-to-pick ───────────────────────────────────────────────────
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.LeftButton:
-            folder = QFileDialog.getExistingDirectory(
-                self, "Choose a folder of PDFs", str(Path.home())
-            )
-            if folder:
-                self.folder_dropped.emit(Path(folder))
+        if event.button() != Qt.LeftButton or self._processing:
+            return
+        menu = QMenu(self)
+        menu.addAction("Pick files…", self._pick_files)
+        menu.addAction("Pick folder…", self._pick_folder)
+        menu.exec(event.globalPosition().toPoint())
+
+    def _pick_files(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Choose PDFs and/or EPUBs",
+            str(Path.home()),
+            "Documents (*.pdf *.epub)",
+        )
+        if files:
+            self.items_dropped.emit([Path(f) for f in files])
+
+    def _pick_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose a folder of PDFs/EPUBs", str(Path.home())
+        )
+        if folder:
+            self.items_dropped.emit([Path(folder)])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -286,11 +483,18 @@ class DropZone(QLabel):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class FileRow(QFrame):
-    """One row per PDF in the progress list."""
+    """One row per file in the progress list.
+
+    Layout (vertical):
+        top row   : [icon]  [filename] ............... [stats]
+        bar row   :         [==thin progress bar==] [ETA]
+        bottom    :         [italic reason / error message]
+    """
 
     STATUS_WAITING = "waiting"
     STATUS_RUNNING = "running"
     STATUS_DONE = "done"
+    STATUS_FAILED = "failed"
 
     def __init__(self, filename: str):
         super().__init__()
@@ -303,10 +507,16 @@ class FileRow(QFrame):
                 border: 1px solid {COLOR_BORDER};
                 border-radius: 8px;
             }}
+            QFrame > QLabel,
+            QFrame > QProgressBar {{ border: none; background: transparent; }}
         """)
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(14, 10, 14, 10)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 10, 14, 10)
+        outer.setSpacing(4)
+
+        top = QHBoxLayout()
+        top.setSpacing(10)
 
         self.icon_label = QLabel("○")
         self.icon_label.setFixedWidth(24)
@@ -328,9 +538,40 @@ class FileRow(QFrame):
         )
         self.stats_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
-        layout.addWidget(self.icon_label)
-        layout.addWidget(self.name_label)
-        layout.addWidget(self.stats_label)
+        top.addWidget(self.icon_label)
+        top.addWidget(self.name_label)
+        top.addWidget(self.stats_label)
+        outer.addLayout(top)
+
+        bar_row = QHBoxLayout()
+        bar_row.setContentsMargins(34, 0, 0, 0)
+        bar_row.setSpacing(8)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setFixedHeight(6)
+        self.progress_bar.setRange(0, 1000)  # finer resolution than 0–100
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        self.eta_label = QLabel("")
+        self.eta_label.setStyleSheet(
+            f"color: {COLOR_TEXT_DIM}; font-size: 11px; border: none;"
+        )
+        self.eta_label.setFixedWidth(90)
+        self.eta_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.eta_label.setVisible(False)
+        bar_row.addWidget(self.progress_bar, stretch=1)
+        bar_row.addWidget(self.eta_label)
+        outer.addLayout(bar_row)
+
+        self.reason_label = QLabel("")
+        self.reason_label.setWordWrap(True)
+        self.reason_label.setContentsMargins(34, 0, 0, 0)
+        self.reason_label.setStyleSheet(
+            f"color: {COLOR_TEXT_DIM}; font-size: 11px; "
+            "font-style: italic; border: none;"
+        )
+        self.reason_label.setVisible(False)
+        outer.addWidget(self.reason_label)
 
     def set_running(self):
         self.status = self.STATUS_RUNNING
@@ -338,29 +579,222 @@ class FileRow(QFrame):
         self.icon_label.setStyleSheet(
             f"color: {COLOR_ACCENT}; font-size: 18px; border: none;"
         )
-        self.stats_label.setText("working...")
+        self.stats_label.setText("starting...")
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(True)
+        self.eta_label.setText("…")
+        self.eta_label.setVisible(True)
+        self.reason_label.setVisible(False)
+
+    def set_progress(self, pages_done: int, total_pages: int, eta_str: str):
+        if self.status != self.STATUS_RUNNING:
+            self.set_running()
+        if total_pages > 0:
+            self.progress_bar.setValue(
+                int(1000 * pages_done / total_pages)
+            )
+        self.stats_label.setText(
+            f"{pages_done}/{total_pages} pages"
+        )
+        self.eta_label.setText(f"ETA {eta_str}")
 
     def set_done(self, pages: int, total_pages: int, words: int,
-                 score: float, grade: str):
+                 score: float, grade: str, reason: str = ""):
+        if grade == "FAILED":
+            self.status = self.STATUS_FAILED
+            self.icon_label.setText("✗")
+            self.icon_label.setStyleSheet(
+                f"color: {COLOR_ERROR}; font-size: 18px; border: none;"
+            )
+            self.progress_bar.setVisible(False)
+            self.eta_label.setVisible(False)
+            self.stats_label.setText("failed")
+            if reason:
+                self.reason_label.setText(reason)
+                self.reason_label.setStyleSheet(
+                    f"color: {COLOR_ERROR}; font-size: 11px; "
+                    "font-style: italic; border: none;"
+                )
+                self.reason_label.setVisible(True)
+            return
+
         self.status = self.STATUS_DONE
+        self.icon_label.setText("●")
         if grade == "GOOD":
-            self.icon_label.setText("●")
             color = COLOR_SUCCESS
         elif grade == "REVIEW":
-            self.icon_label.setText("●")
             color = COLOR_WARNING
         else:
-            self.icon_label.setText("✗")
             color = COLOR_ERROR
         self.icon_label.setStyleSheet(
             f"color: {color}; font-size: 18px; border: none;"
         )
-        if grade == "FAILED":
-            self.stats_label.setText("failed")
-        else:
-            self.stats_label.setText(
-                f"{pages}/{total_pages} pages  ·  {words:,} words  ·  {score:.0f}/100"
+        self.progress_bar.setValue(1000)
+        self.eta_label.setText("done")
+        self.stats_label.setText(
+            f"{pages}/{total_pages} pages  ·  "
+            f"{words:,} words  ·  {score:.0f}/100"
+        )
+        if reason:
+            self.reason_label.setText(reason)
+            self.reason_label.setStyleSheet(
+                f"color: {COLOR_TEXT_DIM}; font-size: 11px; "
+                "font-style: italic; border: none;"
             )
+            self.reason_label.setVisible(True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# EXPORT-FOR-AI DIALOG
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ExportDialog(QDialog):
+    """Pool extracted MD files into a target-shaped skill package + PROMPT.md.
+
+    The LLM still builds the skill metadata (SKILL.md / GEMINI.md / Custom
+    GPT instructions / Cursor rules). DocMind just stages references and
+    hands the user a ready-to-paste prompt.
+    """
+
+    def __init__(
+        self,
+        files: list[Path],
+        suggested_name: str,
+        output_root: Path,
+        parent: QWidget | None = None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Export for AI")
+        self.setMinimumWidth(540)
+        self._files = files
+        self._output_root = output_root
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+
+        # Target
+        layout.addWidget(self._label("Target AI"))
+        self.target_combo = QComboBox()
+        for t in skill_export.TARGETS.values():
+            self.target_combo.addItem(t.display_name, userData=t.id)
+        layout.addWidget(self.target_combo)
+
+        # Name
+        layout.addWidget(self._label("Skill name"))
+        self.name_edit = QLineEdit(skill_export.slugify_name(suggested_name))
+        layout.addWidget(self.name_edit)
+
+        # Description
+        layout.addWidget(self._label("Short description"))
+        default_desc = (
+            "Reference material extracted by DocMind from: "
+            + ", ".join(f.stem for f in files[:3])
+            + ("…" if len(files) > 3 else "")
+        )
+        self.desc_edit = QPlainTextEdit(default_desc)
+        self.desc_edit.setFixedHeight(60)
+        layout.addWidget(self.desc_edit)
+
+        # Files
+        layout.addWidget(self._label("Files to include"))
+        self.files_list = QListWidget()
+        self.files_list.setFixedHeight(110)
+        for f in files:
+            item = QListWidgetItem(f.name)
+            item.setData(Qt.UserRole, f)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked)
+            self.files_list.addItem(item)
+        layout.addWidget(self.files_list)
+
+        # Clipboard option
+        self.clip_check = QCheckBox("Copy prompt to clipboard on success")
+        self.clip_check.setChecked(True)
+        layout.addWidget(self.clip_check)
+
+        # Status line (inline — no popup)
+        self.status = QLabel("")
+        self.status.setStyleSheet(
+            f"color: {COLOR_TEXT_DIM}; font-size: 12px;"
+        )
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        # Buttons
+        buttons = QDialogButtonBox()
+        self.create_btn = buttons.addButton(
+            "Create Package", QDialogButtonBox.AcceptRole
+        )
+        buttons.addButton(QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._on_create)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        # Inherit parent styling
+        if parent:
+            self.setStyleSheet(parent.styleSheet() + f"""
+                QDialog {{ background-color: {COLOR_BG}; }}
+                QLineEdit, QPlainTextEdit, QComboBox, QListWidget {{
+                    background-color: {COLOR_SURFACE};
+                    color: {COLOR_TEXT};
+                    border: 1px solid {COLOR_BORDER};
+                    border-radius: 6px;
+                    padding: 6px;
+                    font-size: 13px;
+                }}
+                QComboBox::drop-down {{ border: none; }}
+            """)
+
+    @staticmethod
+    def _label(text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
+            f"color: {COLOR_TEXT_DIM}; font-size: 11px; "
+            "font-weight: 600; text-transform: uppercase;"
+        )
+        return lbl
+
+    def _checked_files(self) -> list[Path]:
+        files = []
+        for i in range(self.files_list.count()):
+            item = self.files_list.item(i)
+            if item.checkState() == Qt.Checked:
+                files.append(Path(item.data(Qt.UserRole)))
+        return files
+
+    def _on_create(self):
+        target_id = self.target_combo.currentData()
+        name = self.name_edit.text().strip() or "untitled"
+        description = self.desc_edit.toPlainText().strip()
+        files = self._checked_files()
+        if not files:
+            self.status.setText("Pick at least one file to include.")
+            return
+
+        try:
+            package_root = skill_export.build_package(
+                target_id=target_id,
+                name=name,
+                description=description,
+                source_files=files,
+                output_root=self._output_root,
+            )
+        except Exception as e:
+            self.status.setText(f"Failed: {type(e).__name__}: {e}")
+            return
+
+        if self.clip_check.isChecked():
+            prompt_text = (package_root / "PROMPT.md").read_text(
+                encoding="utf-8"
+            )
+            QApplication.clipboard().setText(prompt_text)
+
+        # Reveal the package folder in Finder for the user to inspect.
+        import subprocess
+        subprocess.run(["open", str(package_root)])
+
+        self.accept()
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -373,6 +807,8 @@ class DocMindWindow(QMainWindow):
         self.source_folder: Path | None = None
         self.worker: ExtractionWorker | None = None
         self.file_rows: dict[str, FileRow] = {}
+        self.last_results_files: list[Path] = []
+        self.output_folder: Path | None = None
 
         self.setWindowTitle("DocMind")
         self.setMinimumSize(720, 620)
@@ -473,8 +909,13 @@ class DocMindWindow(QMainWindow):
         header.addWidget(subtitle)
         layout.addLayout(header)
 
+        # U6: OCR health banner — added only if the smoke test fails at startup.
+        ok, err = extract_v4.self_test_ocr()
+        if not ok:
+            layout.addWidget(self._build_ocr_banner(err))
+
         self.drop_zone = DropZone()
-        self.drop_zone.folder_dropped.connect(self._on_folder_selected)
+        self.drop_zone.items_dropped.connect(self._on_items_dropped)
         layout.addWidget(self.drop_zone)
 
         options_layout = QHBoxLayout()
@@ -483,22 +924,12 @@ class DocMindWindow(QMainWindow):
         )
         options_layout.addWidget(self.force_ocr_check)
         options_layout.addStretch()
-        layout.addLayout(options_layout)
-
-        action_layout = QHBoxLayout()
-        action_layout.setSpacing(12)
-        self.extract_btn = QPushButton("Extract")
-        self.extract_btn.setEnabled(False)
-        self.extract_btn.clicked.connect(self._on_extract_clicked)
-        self.extract_btn.setMinimumHeight(44)
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.setObjectName("secondary")
         self.stop_btn.setVisible(False)
         self.stop_btn.clicked.connect(self._on_stop_clicked)
-        self.stop_btn.setMinimumHeight(44)
-        action_layout.addWidget(self.extract_btn, stretch=1)
-        action_layout.addWidget(self.stop_btn)
-        layout.addLayout(action_layout)
+        options_layout.addWidget(self.stop_btn)
+        layout.addLayout(options_layout)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setTextVisible(False)
@@ -538,42 +969,59 @@ class DocMindWindow(QMainWindow):
         self.finished_label.setVisible(False)
         layout.addWidget(self.finished_label)
 
+        completion_actions = QHBoxLayout()
+        completion_actions.setSpacing(12)
         self.reveal_btn = QPushButton("Show in Finder")
         self.reveal_btn.setObjectName("secondary")
         self.reveal_btn.clicked.connect(self._reveal_output)
         self.reveal_btn.setVisible(False)
-        layout.addWidget(self.reveal_btn)
-
-    def _on_folder_selected(self, folder: Path):
-        self.source_folder = folder
-        count = sum(
-            1 for f in folder.iterdir()
-            if f.suffix.lower() == ".pdf"
-        )
-        self.drop_zone._set_loaded(folder, count)
-        self.extract_btn.setEnabled(count > 0)
-        self.progress_bar.setVisible(False)
-        self.status_label.setVisible(False)
-        self.file_list_scroll.setVisible(False)
-        self.finished_label.setVisible(False)
-        self.reveal_btn.setVisible(False)
-        self._clear_file_list()
+        self.export_btn = QPushButton("Export for AI…")
+        self.export_btn.clicked.connect(self._on_export_clicked)
+        self.export_btn.setVisible(False)
+        self.export_btn.setEnabled(False)
+        completion_actions.addWidget(self.reveal_btn)
+        completion_actions.addWidget(self.export_btn)
+        layout.addLayout(completion_actions)
 
     def _clear_file_list(self):
         for row in self.file_rows.values():
             row.deleteLater()
         self.file_rows.clear()
 
-    def _on_extract_clicked(self):
-        if not self.source_folder:
+    @staticmethod
+    def _derive_output_folder(paths: list[Path]) -> Path:
+        """Decide where to write `extracted/` for a given drop payload.
+
+        - Single folder dropped → <folder>/extracted/
+        - One or more files dropped → <parent_of_first>/extracted/
+        """
+        if len(paths) == 1 and paths[0].is_dir():
+            return paths[0] / "extracted"
+        for p in paths:
+            if p.is_file():
+                return p.parent / "extracted"
+        # Fallback: first folder parent
+        return paths[0].parent / "extracted"
+
+    def _on_items_dropped(self, paths: list[Path]):
+        """Auto-start extraction as soon as PDFs/EPUBs/folders are dropped."""
+        if self.worker and self.worker.isRunning():
+            return  # Guard against drops while a run is in flight
+
+        files = collect_files(paths)
+        if not files:
+            self.status_label.setText(
+                "No PDF or EPUB files found in that drop."
+            )
+            self.status_label.setVisible(True)
             return
-        output_folder = self.source_folder / "extracted"
+
+        output_folder = self._derive_output_folder(paths)
+        self.source_folder = (
+            paths[0] if paths[0].is_dir() else paths[0].parent
+        )
 
         self._clear_file_list()
-        files = sorted(
-            f for f in self.source_folder.iterdir()
-            if f.suffix.lower() == ".pdf"
-        )
         for f in files:
             row = FileRow(f.name)
             self.file_rows[f.name] = row
@@ -581,7 +1029,7 @@ class DocMindWindow(QMainWindow):
                 self.file_list_layout.count() - 1, row
             )
 
-        self.extract_btn.setVisible(False)
+        self.drop_zone.set_processing(True)
         self.stop_btn.setVisible(True)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
@@ -593,16 +1041,20 @@ class DocMindWindow(QMainWindow):
         self.force_ocr_check.setEnabled(False)
 
         self.worker = ExtractionWorker(
-            self.source_folder,
+            files,
             output_folder,
             force_ocr=self.force_ocr_check.isChecked(),
         )
         self.worker.file_started.connect(self._on_file_started)
+        self.worker.file_progress.connect(self._on_file_progress)
         self.worker.file_finished.connect(self._on_file_finished)
         self.worker.progress.connect(self._on_progress)
         self.worker.finished_all.connect(self._on_finished_all)
         self.worker.error.connect(self._on_error)
         self.output_folder = output_folder
+        self.last_results_files = [
+            output_folder / extract_v4.slugify(f.name) for f in files
+        ]
         self.worker.start()
 
     def _on_stop_clicked(self):
@@ -615,18 +1067,24 @@ class DocMindWindow(QMainWindow):
         if row:
             row.set_running()
 
-    def _on_file_finished(self, filename: str, pages: int, total: int,
-                          words: int, score: float, grade: str):
+    def _on_file_progress(self, filename: str, pages_done: int,
+                          total_pages: int, eta_str: str):
         row = self.file_rows.get(filename)
         if row:
-            row.set_done(pages, total, words, score, grade)
+            row.set_progress(pages_done, total_pages, eta_str)
+
+    def _on_file_finished(self, filename: str, pages: int, total: int,
+                          words: int, score: float, grade: str,
+                          reason: str):
+        row = self.file_rows.get(filename)
+        if row:
+            row.set_done(pages, total, words, score, grade, reason)
 
     def _on_progress(self, pct: int, text: str):
         self.progress_bar.setValue(pct)
         self.status_label.setText(text)
 
     def _on_finished_all(self, summary: str):
-        self.extract_btn.setVisible(True)
         self.stop_btn.setVisible(False)
         self.force_ocr_check.setEnabled(True)
         self.progress_bar.setValue(100)
@@ -634,17 +1092,95 @@ class DocMindWindow(QMainWindow):
         self.finished_label.setText(summary)
         self.finished_label.setVisible(True)
         self.reveal_btn.setVisible(True)
+        self.drop_zone.set_processing(False)
+        self._update_export_availability()
 
     def _on_error(self, msg: str):
-        self.extract_btn.setVisible(True)
         self.stop_btn.setVisible(False)
         self.force_ocr_check.setEnabled(True)
         self.status_label.setText(f"Error: {msg.splitlines()[0]}")
+        self.drop_zone.set_processing(False)
+
+    def _update_export_availability(self):
+        """Enable the Export button if at least one extracted MD exists."""
+        if not hasattr(self, "export_btn"):
+            return
+        any_output = any(
+            p.exists() for p in getattr(self, "last_results_files", [])
+        )
+        self.export_btn.setVisible(any_output)
+        self.export_btn.setEnabled(any_output)
 
     def _reveal_output(self):
-        if hasattr(self, "output_folder") and self.output_folder.exists():
+        if hasattr(self, "output_folder") and self.output_folder and self.output_folder.exists():
             import subprocess
             subprocess.run(["open", str(self.output_folder)])
+
+    # ── OCR health banner ────────────────────────────────────────────────
+
+    def _build_ocr_banner(self, err: str) -> QWidget:
+        """Yellow banner shown when self_test_ocr() fails at startup."""
+        banner = QFrame()
+        banner.setStyleSheet(f"""
+            QFrame {{
+                background-color: #3a2f1a;
+                border: 1px solid {COLOR_WARNING};
+                border-radius: 8px;
+            }}
+            QLabel {{
+                color: {COLOR_WARNING};
+                font-size: 12px;
+                border: none;
+                background: transparent;
+            }}
+            QPushButton {{
+                background: transparent;
+                color: {COLOR_WARNING};
+                border: none;
+                padding: 4px 8px;
+                font-size: 14px;
+                font-weight: 700;
+            }}
+            QPushButton:hover {{ color: {COLOR_TEXT}; }}
+        """)
+        h = QHBoxLayout(banner)
+        h.setContentsMargins(12, 8, 8, 8)
+        msg = QLabel(
+            f"⚠  OCR unavailable — {err}.  "
+            "Re-run install.sh or check that tesseract is on your PATH."
+        )
+        msg.setWordWrap(True)
+        dismiss = QPushButton("✕")
+        dismiss.setFixedWidth(28)
+        dismiss.clicked.connect(lambda: banner.setVisible(False))
+        h.addWidget(msg, stretch=1)
+        h.addWidget(dismiss)
+        return banner
+
+    # ── Export for AI ────────────────────────────────────────────────────
+
+    def _on_export_clicked(self):
+        if not skill_export:
+            self.status_label.setText(
+                "skill_export module unavailable — cannot export."
+            )
+            self.status_label.setVisible(True)
+            return
+        existing = [p for p in self.last_results_files if p.exists()]
+        if not existing:
+            return
+        suggested_name = (
+            self.source_folder.name
+            if self.source_folder and self.source_folder.is_dir()
+            else existing[0].stem
+        )
+        dialog = ExportDialog(
+            files=existing,
+            suggested_name=suggested_name,
+            output_root=self.output_folder or existing[0].parent,
+            parent=self,
+        )
+        dialog.exec()
 
 
 # ═══════════════════════════════════════════════════════════════════════════

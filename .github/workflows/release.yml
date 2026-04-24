@@ -1,0 +1,92 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build (e.g. 1.0.0). If empty, "dev" is used.'
+        required: false
+        default: ''
+
+jobs:
+  build-dmg:
+    runs-on: macos-latest
+    permissions:
+      contents: write   # upload DMG as a Release asset
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Derive version
+        id: ver
+        run: |
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V="${{ github.event.inputs.version }}"
+            [[ -z "$V" ]] && V="dev"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Building version: $V"
+
+      - name: Install Homebrew deps (tesseract, leptonica, dylibbundler, create-dmg)
+        run: |
+          brew update
+          brew install tesseract leptonica dylibbundler create-dmg
+
+      - name: Install Python deps
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install \
+            py2app \
+            pymupdf pdfplumber pytesseract pdf2image \
+            Pillow opencv-python \
+            ebooklib beautifulsoup4 \
+            pyside6
+
+      - name: Build DMG
+        run: ./build_release.sh "${{ steps.ver.outputs.version }}"
+
+      - name: Smoke test the bundled tesseract
+        run: |
+          APP="dist/DocMind.app"
+          BIN="$APP/Contents/Resources/bin/tesseract"
+          test -x "$BIN" || { echo "bundled tesseract missing"; exit 1; }
+          TESSDATA_PREFIX="$APP/Contents/Resources/tessdata" "$BIN" --version
+          # Ensure it resolves dylibs from inside the bundle (no Homebrew path left)
+          if otool -L "$BIN" | grep -E '/opt/homebrew|/usr/local/Cellar'; then
+            echo "ERROR: bundled tesseract still references Homebrew paths"
+            exit 1
+          fi
+
+      - name: Upload DMG as workflow artifact (always)
+        uses: actions/upload-artifact@v4
+        with:
+          name: DocMind-${{ steps.ver.outputs.version }}-dmg
+          path: dist/DocMind-${{ steps.ver.outputs.version }}.dmg
+          retention-days: 14
+
+      - name: Attach DMG to GitHub Release (tag pushes only)
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/DocMind-${{ steps.ver.outputs.version }}.dmg
+          body: |
+            **DocMind ${{ steps.ver.outputs.version }}**
+
+            1. Download `DocMind-${{ steps.ver.outputs.version }}.dmg` below.
+            2. Open it. Drag the DocMind icon onto the Applications folder.
+            3. Launch DocMind from Applications.
+
+            On first launch, macOS Gatekeeper will say *"DocMind cannot be opened because Apple cannot check it for malicious software."*
+            Right-click DocMind → **Open** → **Open**. You only do this once.
